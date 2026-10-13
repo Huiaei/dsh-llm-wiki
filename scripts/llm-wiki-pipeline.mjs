@@ -4,12 +4,14 @@
  * lint → 索引重建 → 记忆体同步 → log.md。零外部依赖。
  * 用法: node llm-wiki-pipeline.mjs [--lint] [--index] [--sync] [--all] [--dry-run]
  */
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, rmSync, utimesSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
+import { CATS, extractFmText, parseFm, parseFmYaml, setFmField, repairStructuredFields } from "./lib/frontmatter.mjs";
+import { STATE_SCHEMA, pageHashes, changedPages, stateEntry, trustTier, isRetired, TRUST_IMPORTANCE } from "./lib/hash.mjs";
 const execFileAsync = promisify(execFile);
 
 // 管道截断（如 head 关闭）不崩溃：忽略 stdout/stderr 的 EPIPE
@@ -38,27 +40,26 @@ const RATE_TARGET = rawArgs[rawArgs.indexOf("--rate") + 1];
 const RATE_VALUE = rawArgs[rawArgs.indexOf("--rating") + 1];
 const DO_RATE = args.has("--rate") && RATE_TARGET && RATE_VALUE;
 
-// frontmatter 定位（支持前置杂行）：返回第一个"行首"--- 块（防值内 --- 如 URL 误判）
-function extractFmText(content) {
-  let start;
-  if (content.startsWith("---")) start = 0;
-  else {
-    const m = content.match(/^---[\r\n]/m);
-    if (!m) return null;
-    start = m.index;
-  }
-  const end = content.indexOf("\n---", start + 3);
-  if (end < 0) return null;
-  return { start, end, fm: content.slice(start + 3, end) };
-}
+// frontmatter 的定位 / 解析 / 序列化已抽到 scripts/lib/frontmatter.mjs（O1：受控子集 + 严格诊断，可单测）
+// extractFmText / parseFm / parseFmYaml / fmSerialize / setFmField / setFmRaw / setFmSeq / repairStructuredFields
 
-// frontmatter 字段设置（有则替换，无则追加；支持 frontmatter 不在文件开头）
-function setFmField(content, field, value) {
-  const blk = extractFmText(content);
-  if (!blk) return content;
-  const re = new RegExp("^" + field + ":.*$", "m");
-  const newFm = re.test(blk.fm) ? blk.fm.replace(re, field + ": " + value) : blk.fm + "\n" + field + ": " + value;
-  return content.slice(0, blk.start + 3) + newFm + "\n---" + content.slice(blk.end + 4);
+/** 写入磁盘后刷新内存页：哈希检测必须基于**盘上的真实内容**，否则同一轮 --all 里
+ *  okf 补的 description 不会被 sync 看到，状态里存的是已经不存在的内容的哈希。 */
+function refreshPage(p) {
+  try {
+    p.content = readFileSync(p.full, "utf8");
+    const blk = extractFmText(p.content);
+    const parsed = blk ? parseFmYaml(blk.fm) : { data: {}, errors: [] };
+    p.fm = parsed.data;
+    p.fmErrors = parsed.errors;
+    p.fmEnd = blk ? blk.end : -1;
+    p.body = blk ? p.content.slice(blk.end + 4) : p.content;
+    const st = statSync(p.full);
+    p.mtime = st.mtimeMs;
+    p.size = st.size;
+    p.hashes = pageHashes(p);
+  } catch {}
+  return p;
 }
 
 // --rate: 手动质量反馈（useful +1 分 / outdated 标 stale）
@@ -115,9 +116,9 @@ function usageSync(pages) {
         content = setFmField(content, "queried_count", u.count);
         if (u.last) content = setFmField(content, "last_queried", u.last);
         if (content !== p.content) {
-          const origMtime = p.mtime; // 恢复原 mtime：元数据回写不触发 sync 重新同步（utimesSync 用秒，mtimeMs 需 /1000）
           writeFileSync(p.full, content);
-          try { utimesSync(p.full, origMtime / 1000, origMtime / 1000); } catch {}
+          // O2：不再伪装 mtime。queried_count/last_queried 不进 draft 指纹，所以本来就不会触发重同步。
+          refreshPage(p);
           updated++;
         }
       }
@@ -128,12 +129,22 @@ function usageSync(pages) {
 
 // ── OKF v0.2 对齐：补 description/sources/generated/stale_after（幂等，只补缺字段）──
 function okfAlign(pages) {
-  let updated = 0, aligned = 0;
+  let updated = 0, aligned = 0, repaired = 0;
+  const repairSample = [];
   for (const p of pages) {
     if (p.cat === "索引") continue;
     let content = p.content;
     const fm = p.fm;
     const today = new Date().toISOString().slice(0, 10);
+    // O1 迁移：旧文件里被写成字符串的 sources/tags/related/… 规范化成真正的数组/映射
+    const rep = repairStructuredFields(content);
+    if (rep.repairs.length) {
+      content = rep.content;
+      repaired++;
+      for (const r of rep.repairs) {
+        if (repairSample.length < 5) repairSample.push(p.rel + " " + r.field + ": " + JSON.stringify(r.from) + " → " + JSON.stringify(r.to));
+      }
+    }
     // description：缺则从 summary 补；无 summary 则从正文首段提取（确定性摘要，幂等）
     if (!fm.description) {
       let desc = null;
@@ -163,22 +174,23 @@ function okfAlign(pages) {
           }
         }
       }
-      if (desc) content = setFmField(content, "description", JSON.stringify(desc));
+      if (desc) content = setFmField(content, "description", desc);
     }
     // sources：有 source 单值 → 转 OKF sources 数组（保留原 source 兼容）
     if (fm.source && !fm.sources) {
-      const res = /^https?:\/\//.test(fm.source) ? fm.source : fm.source;
-      content = setFmField(content, "sources", "[{ resource: " + JSON.stringify(res) + " }]");
+      content = setFmField(content, "sources", [{ resource: fm.source }]);
     }
     // generated：补 by/at（at 用 created/updated 日期近似 ISO）
     if (!fm.generated) {
       const at = (fm.updated || fm.created || today) + "T00:00:00Z";
-      content = setFmField(content, "generated", "{ by: agent/dsh-llm-wiki, at: " + at + " }");
+      content = setFmField(content, "generated", { by: "agent/dsh-llm-wiki", at });
     }
-    // verified：quality_score >= 4 且无 verified 时，自动标记 agent verified
-    if (!fm.verified && Number(fm.quality_score) >= 4) {
+    // verified：仅当质量分达标、未过期、未被取代、且非草稿时才自动标记
+    // （否则 --rate useful 能把分数刷到 4，让被注入的页面顺着作者自己的闭环升格成"已验证知识"）
+    if (!fm.verified && Number(fm.quality_score) >= 4
+        && fm.status !== "stale" && fm.status !== "draft" && !fm.superseded_by) {
       const at = (fm.updated || fm.created || today) + "T00:00:00Z";
-      content = setFmField(content, "verified", "{ by: agent/dsh-llm-wiki, at: " + at + " }");
+      content = setFmField(content, "verified", { by: "agent/dsh-llm-wiki", at });
     }
     // stale_after：created/updated + 90 天
     if (!fm.stale_after) {
@@ -189,14 +201,13 @@ function okfAlign(pages) {
       }
     }
     if (content !== p.content) {
-      // 恢复原 mtime：--okf 是元数据规范化（记忆体条目用 summary 不含 description），不触发 sync 重新导入
-      const origMtime = p.mtime;
+      // O2：不再恢复 mtime。--okf 补的 description 进 draft 指纹 → 这一轮就该同步，而不是永不
       writeFileSync(p.full, content);
-      try { utimesSync(p.full, origMtime / 1000, origMtime / 1000); } catch {}
+      refreshPage(p);
       updated++; aligned++;
     }
   }
-  return { aligned, updated };
+  return { aligned, updated, repaired, repairSample };
 }
 
 
@@ -216,7 +227,9 @@ function compilePatterns(pages) {
   const orphanPages = [];
   for (const pg of pages) {
     if (pg.cat === "索引") continue;
-    const body = pg.content.slice(pg.fmEnd + 4);
+    // O2 顺带修复：旧代码用 pg.fmEnd（collectPages 从未设置过）→ undefined + 4 = NaN → slice(NaN) 取到全文，
+    // 于是 frontmatter 里的 related 链接会把页面误判成"非孤立"
+    const body = pg.body != null ? pg.body : pg.content;
     const linkCount = (body.match(/\[\[/g) || []).length;
     if (linkCount === 0) orphanPages.push(pg);
   }
@@ -411,7 +424,7 @@ function docsSync() {
     if (!existsSync(DOCS_DIR)) return { error: "无 documents 目录" };
     // 已有 wiki 页 title 规范化集（去重）
     const existing = new Set();
-    for (const cat of ["决策","发现","概念","项目","流程","命令","规则","提示","记忆","基因","引用"]) {
+    for (const cat of CATS) {
       const dir = join(WIKI, cat);
       let files = [];
       try { files = readdirSync(dir).filter(f => f.endsWith(".md") && f !== "index.md"); } catch { continue; }
@@ -469,17 +482,6 @@ function pruneMemory() {
   } finally { try { db.close(); } catch {} }
 }
 
-function parseFm(content) {
-  const fm = {};
-  const blk = extractFmText(content);
-  if (!blk) return fm;
-  for (const line of blk.fm.split("\n")) {
-    const kv = line.match(/^([\w_]+):\s*(.*)$/);
-    if (kv) fm[kv[1]] = kv[2].replace(/^["']|["']$/g, "");
-  }
-  return fm;
-}
-
 function collectPages() {
   const pages = [];
   function walk(dir, cat) {
@@ -491,12 +493,22 @@ function collectPages() {
         else if (e.endsWith(".md") && e !== "index.md") {
           const content = readFileSync(full, "utf8");
           const st = statSync(full);
-          pages.push({ cat, file: e, full, rel: relative(VAULT, full), content, fm: parseFm(content), mtime: st.mtimeMs, size: st.size });
+          const blk = extractFmText(content);
+          const parsed = blk ? parseFmYaml(blk.fm) : { data: {}, errors: [] };
+          const p = {
+            cat, file: e, full, rel: relative(VAULT, full), content,
+            fm: parsed.data, fmErrors: parsed.errors,
+            fmEnd: blk ? blk.end : -1,
+            body: blk ? content.slice(blk.end + 4) : content,
+            mtime: st.mtimeMs, size: st.size,
+          };
+          p.hashes = pageHashes(p);        // O2：语义指纹在收集时一次算好
+          pages.push(p);
         }
       } catch {}
     }
   }
-  for (const cat of ["决策","发现","概念","项目","流程","命令","规则","提示","记忆","基因","引用"]) {
+  for (const cat of CATS) {
     const dir = join(WIKI, cat);
     if (existsSync(dir) && statSync(dir).isDirectory()) walk(dir, cat);
   }
@@ -506,6 +518,14 @@ function collectPages() {
 function lint(pages) {
   const issues = [];
   const links = new Map();
+  // 页面索引：related 目标存在性校验用（文件名与相对路径、带不带 .md 都认）
+  const pageIndex = new Set();
+  for (const p of pages) {
+    const stem = p.file.replace(/\.md$/, "");
+    pageIndex.add(stem);
+    pageIndex.add(p.rel);
+    pageIndex.add(p.rel.replace(/\.md$/, ""));
+  }
   for (const p of pages) {
     // OKF 结构检查
     const content = p.content;
@@ -516,6 +536,34 @@ function lint(pages) {
     }
     for (const f of ["title", "type", "created"]) {
       if (!p.fm[f]) issues.push({ type: "missing_frontmatter", path: p.rel, message: "缺 " + f });
+    }
+    // ── O1：结构化校验（旧解析器把 tags/sources/verified 读成字符串，这些检查此前不可能存在）──
+    for (const e of (p.fmErrors || [])) issues.push({ type: "fm_syntax", path: p.rel, message: e });
+    // 解析本身失败时，基于误读值的形状检查只会产生噪声（如把 &anchor 误读成字符串后再报"tags 应为数组"）
+    const fmd = p.fm;
+    if (!(p.fmErrors || []).length) {
+      if (fmd.type && !CATS.includes(String(fmd.type))) {
+        issues.push({ type: "type_dir", path: p.rel, message: "type=" + fmd.type + " 不是已知分类" });
+      }
+      if (fmd.type && String(fmd.type) !== p.cat) {
+        issues.push({ type: "type_dir", path: p.rel, message: "type=" + fmd.type + " 与目录 " + p.cat + " 不一致" });
+      }
+      if (Array.isArray(fmd.related)) {
+        for (const r of fmd.related) {
+          const target = String(r).replace(/^\[\[|\]\]$/g, "").split("|")[0].trim();
+          if (target && !pageIndex.has(target) && !pageIndex.has(target + ".md")) {
+            issues.push({ type: "dangling_link", path: p.rel, message: "related 指向不存在的页面: " + target });
+          }
+        }
+      } else if (fmd.related !== undefined && fmd.related !== "") {
+        issues.push({ type: "fm_shape", path: p.rel, message: "related 应为数组" });
+      }
+      if (fmd.tags !== undefined && fmd.tags !== "" && !Array.isArray(fmd.tags)) {
+        issues.push({ type: "fm_shape", path: p.rel, message: "tags 应为数组" });
+      }
+      if (fmd.stale_after && new Date(fmd.stale_after) < new Date() && fmd.status !== "stale") {
+        issues.push({ type: "stale_after", path: p.rel, message: "已过期: " + fmd.stale_after });
+      }
     }
     const wl = (p.content.match(/\[\[[^\]]+\]\]/g) || []).length;
     if (wl < 2) issues.push({ type: "few_wikilinks", path: p.rel, message: "wikilink " + wl });
@@ -539,13 +587,15 @@ function lint(pages) {
     const u = p.fm.updated || p.fm.created;
     return u && new Date(u) < cutoff && p.fm.status !== "stale";
   });
-  return { issues, orphans, stale, pageCount: pages.length };
+  const byType = {};
+  for (const i of issues) byType[i.type] = (byType[i.type] || 0) + 1;
+  return { issues, orphans, stale, pageCount: pages.length, byType };
 }
 
 function rebuildIndex(pages) {
   const byCat = {};
   for (const p of pages) byCat[p.cat] = (byCat[p.cat] || 0) + 1;
-  const cats = ["决策","发现","概念","项目","流程","命令","规则","提示","记忆","基因","引用"].filter(c => byCat[c]);
+  const cats = CATS.filter(c => byCat[c]);
   let md = "# LLM-Wiki 知识库导航\n\nAgent 自主浏览入口。通过以下分类逐级浏览。\n\n> 此页面由管线自动维护。\n\n## 分类\n\n";
   for (const c of cats) md += "* [wiki/" + c + "](wiki/" + c + "/index.md) — " + byCat[c] + " 条\n";
   const recent = [...pages].sort((a, b) => b.mtime - a.mtime).slice(0, 10);
@@ -556,19 +606,26 @@ function rebuildIndex(pages) {
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
 function saveState(s) { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(s, null, 1)); }
-// 变更检测：mtime 单因子（usage 元数据回写会恢复 mtime，不触发重复同步）
-function changedPages(pages, state) {
-  return pages.filter(p => { const st = state[p.rel]; return !st || st.mtime !== p.mtime; });
-}
 function generateDraft(changed) {
-  return changed.map(p => {
-    const desc = (p.fm.description || p.fm.summary) && (p.fm.description || p.fm.summary) !== "-" ? "：" + (p.fm.description || p.fm.summary) : "";
-    return {
-      content: "[LLM-Wiki/" + p.cat + "] " + (p.fm.title || p.file) + desc + "（来源: " + p.rel + "）",
-      tags: ["llm-wiki", p.cat, ...(p.fm.project ? [p.fm.project] : [])].filter(Boolean),
-      importance: Number(p.fm.quality_score) >= 5 ? 4 : 3,
-    };
-  });
+  return changed
+    // 已废弃 / 被取代 → 不进召回。
+    // 边界（已知，属 O4 范围）：这只能阻止**进入**召回，无法删除 mnemon 里**已经存在**的条目 ——
+    // mnemon 没有暴露删除/降权的原语。所以对一个早已同步过的页面加 superseded_by，本轮只是
+    // 不再重导（syncMemory 会把它计入 retired），它在 mnemon 里的旧权重仍然存在。
+    .filter(p => !isRetired(p.fm))
+    .map(p => {
+      const d = p.fm.description || p.fm.summary;
+      const desc = d && d !== "-" ? "：" + d : "";
+      const tier = trustTier(p.fm);
+      // 置信度决定召回权重，质量分作为小幅修正（draft 指纹已把 tier 纳入，所以它必须真正生效）
+      const importance = Math.max(1, Math.min(5,
+        TRUST_IMPORTANCE[tier] + (Number(p.fm.quality_score) >= 5 ? 1 : 0) - (p.fm.status === "stale" ? 1 : 0)));
+      return {
+        content: "[LLM-Wiki/" + p.cat + "] " + (p.fm.title || p.file) + desc + "（来源: " + p.rel + "）",
+        tags: ["llm-wiki", p.cat, "trust:" + tier, ...(p.fm.project ? [p.fm.project] : [])].filter(Boolean),
+        importance,
+      };
+    });
 }
 
 function startFakeEmbed() {
@@ -584,9 +641,18 @@ async function ollamaAlive() {
 async function syncMemory(pages) {
   const syncPages = pages.filter(p => p.cat !== "引用" && !(p.cat === "发现" && p.file.includes("会话复盘")));
   const state = loadState();
-  const changed = changedPages(syncPages, state);
-  if (changed.length === 0) return { synced: 0, note: "无变更页面" };
-  const draft = { schema_version: "1", insights: generateDraft(changed) };
+  const { changed, drift, bodyDrift } = changedPages(syncPages, state);
+  const toSync = changed.filter(p => !isRetired(p.fm));
+  // 没有需要重导的页时也要把漂移认下来，否则每一轮都会重复报同一次漂移
+  if (toSync.length === 0) {
+    if (changed.length || drift.length) {
+      const ns = { ...state };
+      for (const p of [...changed, ...drift]) ns[p.rel] = stateEntry(p);
+      saveState(ns);
+    }
+    return { synced: 0, retired: changed.length - toSync.length, drift: drift.length, bodyDrift: bodyDrift.length, note: "无需重导" };
+  }
+  const draft = { schema_version: "1", insights: generateDraft(toSync) };
   const tmp = join(STATE_DIR, "sync-draft-" + Date.now() + ".json");
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(tmp, JSON.stringify(draft, null, 1));
@@ -605,9 +671,16 @@ async function syncMemory(pages) {
     try { rmSync(tmp, { force: true }); } catch {}
   }
   const ns = { ...state };
-  for (const p of changed) ns[p.rel] = { mtime: p.mtime, size: p.size };
+  for (const p of [...changed, ...drift]) ns[p.rel] = stateEntry(p);
   saveState(ns);
-  return { synced: changed.length, changed: changed.map(p => p.rel).slice(0, 5) };
+  return {
+    synced: toSync.length,
+    retired: changed.length - toSync.length,
+    drift: drift.length,
+    bodyDrift: bodyDrift.length,
+    changed: toSync.map(p => p.rel).slice(0, 5),
+    drifted: drift.map(p => p.rel).slice(0, 5),
+  };
 }
 
 function appendLog(entry) {
@@ -634,6 +707,7 @@ async function main() {
     const r = lint(pages);
     console.log("\n== lint ==");
     console.log("问题:", r.issues.length, "| 孤立节点:", r.orphans.length, "| stale:", r.stale.length);
+    console.log("  分类:", Object.entries(r.byType).map(([k, v]) => k + "=" + v).join(" ") || "无");
     for (const i of r.issues.slice(0, 8)) console.log("  [问题]", i.path, i.message);
     for (const o of r.orphans.slice(0, 5)) console.log("  [孤立]", o.rel);
     summary.push("lint:" + r.issues.length + "问题/" + r.orphans.length + "孤立/" + r.stale.length + "stale");
@@ -650,8 +724,13 @@ async function main() {
   }
   if (RUN.okf) {
     console.log("\n== okf ==");
-    if (DRY) console.log("(--dry-run) 将补 OKF v0.2 字段（description/sources/generated/stale_after）");
-    else { const r = okfAlign(pages); console.log("OKF 对齐:", JSON.stringify(r)); summary.push("okf:" + (r.aligned || 0) + "页"); }
+    if (DRY) console.log("(--dry-run) 将补 OKF v0.2 字段（description/sources/generated/verified/stale_after），并把旧的字符串形式字段规范化为受控子集 YAML");
+    else {
+      const r = okfAlign(pages);
+      console.log("OKF 对齐:", JSON.stringify(r));
+      for (const s of (r.repairSample || [])) console.log("  [规范化]", s);
+      summary.push("okf:" + (r.aligned || 0) + "页" + (r.repaired ? "/规范化" + r.repaired : ""));
+    }
   }
   if (RUN.compilePatterns) {
     console.log("\n== compile-patterns ==");
@@ -677,13 +756,14 @@ async function main() {
     console.log("\n== sync ==");
     if (DRY) {
       const syncPages = pages.filter(p => p.cat !== "引用" && !(p.cat === "发现" && p.file.includes("会话复盘")));
-      const state = loadState(); const changed = changedPages(syncPages, state);
-      console.log("(--dry-run) 变更页面:", changed.length);
-      summary.push("sync(dry):" + changed.length);
+      const state = loadState(); const { changed, drift, bodyDrift } = changedPages(syncPages, state);
+      const toSync = changed.filter(p => !isRetired(p.fm));
+      console.log("(--dry-run) 待重导:", toSync.length, "| 已废弃:", changed.length - toSync.length, "| 外部漂移:", drift.length, "(其中正文漂移 " + bodyDrift.length + ")");
+      summary.push("sync(dry):" + toSync.length);
     } else {
       const r = await syncMemory(pages);
       console.log("同步:", JSON.stringify(r));
-      summary.push("sync:" + (r.synced || 0) + "条" + (r.error ? " ERR:" + r.error : ""));
+      summary.push("sync:" + (r.synced || 0) + "条" + (r.drift ? "/漂移" + r.drift : "") + (r.error ? " ERR:" + r.error : ""));
     }
   }
   if (!DRY) appendLog(summary.join(" | "));

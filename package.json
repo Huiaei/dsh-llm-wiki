@@ -20,6 +20,9 @@
   "engines": {
     "node": ">=20.0.0"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

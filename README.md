@@ -77,8 +77,8 @@ systemctl --user restart dsh-web
 ### 管线路由
 
 ```bash
-node ~/bin/llm-wiki-pipeline.mjs --lint          # frontmatter 完整性 + 孤立节点检测 + stale 报告
-node ~/bin/llm-wiki-pipeline.mjs --okf           # OKF v0.2 字段补齐（幂等，verified 自动标记）
+node ~/bin/llm-wiki-pipeline.mjs --lint          # frontmatter 完整性 + YAML 子集校验 + type↔目录 + related 悬空链接 + stale 报告
+node ~/bin/llm-wiki-pipeline.mjs --okf           # OKF v0.2 字段补齐 + 旧字符串字段规范化为受控子集 YAML（幂等）
 node ~/bin/llm-wiki-pipeline.mjs --compile-patterns  # 从孤立节点聚类生成 pattern 页
 node ~/bin/llm-wiki-pipeline.mjs --index         # 重建导航页
 node ~/bin/llm-wiki-pipeline.mjs --sync          # 变更同步到 mnemon 记忆体
@@ -93,7 +93,7 @@ node ~/bin/llm-wiki-pipeline.mjs --all --dry-run # 预览模式（零写入）
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | LLM_WIKI_VAULT | /mnt/d/DB/Obsidian/LLM-Wiki | vault 路径 |
-| LLM_WIKI_STATE | ~/.dsh/llm-wiki/pipeline-state.json | 管线增量状态文件 |
+| LLM_WIKI_STATE | ~/.dsh/llm-wiki/pipeline-state.json | 管线增量状态文件（schema 2：存语义指纹；旧版 mtime 状态会被识别为过期并触发一次全量重算） |
 | EMBED_KEY | 读 ~/.modlens/config.json | SiliconFlow API key |
 | EMBED_MODEL | BAAI/bge-m3 | 向量模型 |
 
@@ -149,11 +149,22 @@ LLM-Wiki/
 
 核心创新：**Pattern 层** — 从孤立节点聚类提取可复用经验，由管线 `--compile-patterns` 自动生成，写入 `wiki/evolution/logs.md` 编译日志。
 
+## 测试
+
+零依赖，用 Node 内置测试运行器：
+
+```bash
+npm test          # = node --test（自动发现 test/ 下的 *.test.mjs）
+```
+
+`test/frontmatter.test.mjs` 覆盖受控 YAML 子集的解析/序列化/规范化，`test/change-detection.test.mjs` 覆盖语义指纹与五种典型改动的判定，`test/pipeline-e2e.test.mjs` 把管线当黑盒跑在临时 vault 上（用 PATH 上的 mnemon stub，不需要真记忆体，也不会碰真实 vault）。
+
 ## 设计原则
 
 - **反脆弱**：检索/写入用 SKILL + DSH 原生工具（零插件故障面）；只有"必须进程内"的注入与事件钩子才进插件（~90 行）
-- **幂等**：管线 mtime 增量检测，重复运行无副作用；`--okf` / `--compile-patterns` 均幂等
-- **闭环**：使用数据（recall 命中）→ queried_count → quality_score → 影响召回 → verified 信任分级
+- **幂等**：变更检测按**语义指纹**（分类/标题/描述/项目/质量分/状态/标签/信任分级/是否退役）而非 mtime，重复运行无副作用；`--okf` / `--compile-patterns` 均幂等
+- **闭环**：使用数据（recall 命中）→ queried_count → quality_score → 影响召回 → verified 信任分级（信任分级直接决定召回权重：human-reviewed 5 / machine-confirmed 4 / unverified 3）
+- **元数据可回读**：frontmatter 由受控 YAML 子集解析（标量 / 内联数组 / 块序列 / 内联映射 / 块映射），超出子集即报错而非静默误读 —— 管线写下的字段，管线自己必须读得回来
 - **本地优先**：wiki 与记忆体全本地，向量可选云端
 - **编译进化**：孤立节点 → pattern 聚类 → 可复用经验，知识随使用不断提炼
 
