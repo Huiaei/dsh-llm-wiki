@@ -1,13 +1,13 @@
 ---
 name: wiki-search
-description: 在 LLM-Wiki 知识库（/mnt/d/DB/Obsidian/LLM-Wiki）中检索知识。当用户问"之前怎么做的、以前的决策、踩坑经验、某主题的知识"或明确提到 LLM-Wiki/知识库/wiki 时使用。入口：rg 关键词搜索 → read 精读原文 → 引用页面路径。
+description: 在 LLM-Wiki 知识库（{{VAULT}}）中检索知识。当用户问"之前怎么做的、以前的决策、踩坑经验、某主题的知识"或明确提到 LLM-Wiki/知识库/wiki 时使用。入口：rg 关键词搜索 → read 精读原文 → 引用页面路径。
 ---
 
 # LLM-Wiki 知识检索
 
 > LLM-Wiki 是 Karpathy 模式的 Obsidian 知识库（866 页，管线自动编译）。检索纪律：**先搜索、后精读、引用原文路径，禁止凭记忆编造知识库内容**。
 
-## 库结构（12 分类，根：/mnt/d/DB/Obsidian/LLM-Wiki/wiki/）
+## 库结构（12 分类，根：{{VAULT}}/wiki/）
 
 | 分类 | 目录 | 内容 |
 |---|---|---|
@@ -36,7 +36,7 @@ description: 在 LLM-Wiki 知识库（/mnt/d/DB/Obsidian/LLM-Wiki）中检索知
 | 只有旧日志命中 | 用 `log.md` 按 `## [YYYY-MM-DD] compile` 找编译记录定位页面 |
 | 用户问的是偏好/协作规则 | 优先查热记忆（MEMORY.md）而非 wiki |
 | 深度语义（"之前聊过的 X"） | 用 mnemon_recall（记忆体召回） |
-| 页面有用/已过时 | 用 `node ~/bin/llm-wiki-pipeline.mjs --rate <路径> --rating useful|outdated` 反馈（驱动 quality_score 闭环） |
+| 页面有用/已过时 | 用 `node ~/bin/llm-wiki-pipeline.mjs --rate <路径> --rating useful\|outdated` 反馈（驱动 quality_score 闭环）。**路径必须是 vault 根下的相对路径且以 `wiki/` 开头** —— 管线会拒绝越界路径、符号链接穿透、以及 raw/ 与会话导出（那两类不是知识页）；`outdated` 会同时撤销该页的 `verified` 标记 |
 | 命中页已过时（stale_after 已过 / status: stale） | 引用时明确标注可能过时，优先找相关新页面或按 sources 字段回原始来源核实 |
 
 ## 写入纪律（产出侧协作）

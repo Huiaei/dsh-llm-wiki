@@ -10,8 +10,9 @@ import { homedir } from "node:os";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
-import { CATS, extractFmText, parseFm, parseFmYaml, setFmField, repairStructuredFields } from "./lib/frontmatter.mjs";
+import { CATS, extractFmText, parseFm, parseFmYaml, setFmField, deleteFmField, repairStructuredFields } from "./lib/frontmatter.mjs";
 import { STATE_SCHEMA, pageHashes, changedPages, stateEntry, trustTier, isRetired, TRUST_IMPORTANCE } from "./lib/hash.mjs";
+import { safeJoinVault } from "./lib/paths.mjs";
 const execFileAsync = promisify(execFile);
 
 // 管道截断（如 head 关闭）不崩溃：忽略 stdout/stderr 的 EPIPE
@@ -30,12 +31,53 @@ const STATE_FILE = process.env.LLM_WIKI_STATE || join(STATE_DIR, "pipeline-state
 const FAKE_EMBED = process.env.LLM_WIKI_FAKE_EMBED || "auto";
 const EXCLUDE_DIRS = new Set(["_archived", "trash", ".smart-env", "索引"]);
 const STALE_DAYS = 90;
+// 生成目录：由管线自己写，不属于知识分类（F2 用来说明「为什么 wiki/ 为空仍可能是健康的」）
+const GENERATED_DIRS = ["索引", "patterns", "evolution"];
+
+// ── F2：破坏性操作的保险阈值 ──
+// 原则：宁可不做，不可做错。删错的记忆体没法恢复，漏跑一次只是晚一天。
+const PRUNE_MIN_PAGES = 10;    // wiki 页面数低于此值 → 拒绝批量软删（典型原因：D 盘没挂载）
+const PRUNE_MAX_RATIO = 0.20;  // 单次待删比例高于此值 → 拒绝（典型原因：路径配错，全部「不存在」）
+
+/** vault 结构性健康检查，返回问题列表（空数组 = 健康）。
+ *  这是所有破坏性写入的前置闸门，也是 main() 的总闸。 */
+function vaultHealth() {
+  const problems = [];
+  if (!existsSync(VAULT)) {
+    problems.push("vault 不存在: " + VAULT);
+    return problems;                       // 不存在就没必要再查子路径
+  }
+  try {
+    if (!statSync(VAULT).isDirectory()) problems.push("vault 不是目录: " + VAULT);
+  } catch { problems.push("vault 无法 stat: " + VAULT); }
+  if (!existsSync(WIKI)) problems.push("wiki/ 不存在（vault 未挂载或路径不对）");
+  return problems;
+}
 
 const rawArgs = process.argv.slice(2);
 const args = new Set(rawArgs);
 const DRY = args.has("--dry-run");
-const doAll = ![...args].some(a => ["--lint", "--index", "--sync", "--rate", "--usage", "--okf", "--prune-memory", "--dsh-export", "--docs-sync"].includes(a));
-const RUN = { lint: doAll || args.has("--lint"), index: doAll || args.has("--index"), sync: doAll || args.has("--sync"), usage: doAll || args.has("--usage"), okf: doAll || args.has("--okf"), compilePatterns: doAll || args.has("--compile-patterns"), prune: doAll || args.has("--prune-memory"), dsh: doAll || args.has("--dsh-export"), docs: doAll || args.has("--docs-sync") };
+const FORCE = args.has("--force");   // 只解除「数量/比例」两道保险，不解除健康检查
+
+// ── F3：路由拆分 —— 破坏性阶段不再隐含在 --all 里 ──
+const SAFE_STAGES = ["--lint", "--index", "--sync", "--usage", "--okf", "--docs-sync"];
+const DESTRUCTIVE_STAGES = ["--prune-memory", "--dsh-export"];
+const EXPLICIT_ONLY = ["--compile-patterns"];   // 会写 patterns/evolution，既不属于安全集也不隐含全量
+const STAGE_FLAGS = [...SAFE_STAGES, ...DESTRUCTIVE_STAGES, ...EXPLICIT_ONLY, "--rate"];
+
+// 「全量」= 没有点名任何阶段。--all 现在只跑六个安全阶段。
+const doAll = ![...args].some(a => STAGE_FLAGS.includes(a));
+const RUN = {
+  lint: doAll || args.has("--lint"),
+  index: doAll || args.has("--index"),
+  sync: doAll || args.has("--sync"),
+  usage: doAll || args.has("--usage"),
+  okf: doAll || args.has("--okf"),
+  docs: doAll || args.has("--docs-sync"),
+  compilePatterns: args.has("--compile-patterns"),   // 只认显式
+  prune: args.has("--prune-memory"),                 // 移出 --all：会软删记忆体
+  dsh: args.has("--dsh-export"),                     // 移出 --all：会把会话记录落盘
+};
 const RATE_TARGET = rawArgs[rawArgs.indexOf("--rate") + 1];
 const RATE_VALUE = rawArgs[rawArgs.indexOf("--rating") + 1];
 const DO_RATE = args.has("--rate") && RATE_TARGET && RATE_VALUE;
@@ -63,9 +105,20 @@ function refreshPage(p) {
 }
 
 // --rate: 手动质量反馈（useful +1 分 / outdated 标 stale）
-function ratePage(rel, rating) {
-  const full = join(VAULT, rel);
-  if (!existsSync(full)) return { error: "文件不存在: " + rel };
+function ratePage(rel, rating, { dry = DRY } = {}) {
+  // F1：路径守卫。--rate 的入参由模型/命令行给出，未校验时 `../../x.md` 能改写 vault 外任意文件。
+  // 分四步给出精确诊断（越界 / 非 .md / 非 wiki / 不存在），最后一步用 mustExist:true 穿透符号链接复查。
+  const pre = safeJoinVault(rel, VAULT, { mustExist: false, ext: null });
+  if (!pre) return { error: "拒绝：路径非法或越出 vault: " + rel };
+  if (!pre.full.endsWith(".md")) return { error: "拒绝：只接受 .md 文件: " + rel };
+  if (!pre.rel.startsWith("wiki/")) {
+    return { error: "拒绝：只能给 wiki/ 下的知识页打分（不接受 raw/ 与会话导出）: " + pre.rel };
+  }
+  if (!existsSync(pre.full)) return { error: "文件不存在: " + rel };
+  const hit = safeJoinVault(rel, VAULT);
+  if (!hit) return { error: "拒绝：路径经符号链接指向 vault 外: " + rel };
+  const full = hit.full;
+
   let content = readFileSync(full, "utf8");
   const fm = parseFm(content);
   const today = new Date().toISOString().slice(0, 10);
@@ -75,16 +128,21 @@ function ratePage(rel, rating) {
     content = setFmField(content, "queried_count", (Number(fm.queried_count) || 0) + 1);
     content = setFmField(content, "last_queried", today);
     if (fm.status === "stale") content = setFmField(content, "status", "active");
+    if (dry) return { ok: true, rel: hit.rel, score: Math.min(cur + 1, 5), note: "(--dry-run) 未写入" };
     writeFileSync(full, content);
-    return { ok: true, rel, score: Math.min(cur + 1, 5), note: "useful 反馈，quality_score 提升" };
+    return { ok: true, rel: hit.rel, score: Math.min(cur + 1, 5), note: "useful 反馈，quality_score 提升" };
   }
   if (rating === "outdated") {
     const cur = Number(fm.quality_score) || 0;
     content = setFmField(content, "quality_score", Math.max(cur - 1, 0));
     content = setFmField(content, "status", "stale");
     content = setFmField(content, "last_queried", today);
+    // 撤销 machine-confirmed 信任标记：页面既被判为过时，自动核验的结论也随之失效。
+    // 否则 okfAlign 写的 verified 会永久留在页面上，继续把它伪装成「已验证内容」。
+    content = deleteFmField(content, "verified");
+    if (dry) return { ok: true, rel: hit.rel, score: Math.max(cur - 1, 0), note: "(--dry-run) 未写入" };
     writeFileSync(full, content);
-    return { ok: true, rel, score: Math.max(cur - 1, 0), note: "outdated 反馈，标记 stale" };
+    return { ok: true, rel: hit.rel, score: Math.max(cur - 1, 0), note: "outdated 反馈，标记 stale 并撤销 verified" };
   }
   return { error: "rating 必须是 useful 或 outdated" };
 }
@@ -222,6 +280,10 @@ function compilePatterns(pages) {
   const patternsDir = join(WIKI, "patterns");
   const evolutionDir = join(WIKI, "evolution");
   const logsFile = join(evolutionDir, "logs.md");
+  // F2：mkdirSync(recursive) 会在挂载缺失时沿 VAULT 路径在根文件系统上造出幽灵目录树
+  // （实测创建过 log.md / wiki/evolution / wiki/patterns）。写入前先确认 vault 结构真的存在。
+  const problems = vaultHealth();
+  if (problems.length) return { skipped: true, reason: "vault 不健康，拒绝生成 pattern 页: " + problems.join("; ") };
   mkdirSync(patternsDir, { recursive: true });
   mkdirSync(evolutionDir, { recursive: true });
   const orphanPages = [];
@@ -459,27 +521,52 @@ function docsSync() {
 }
 
 // ── --prune-memory: 清记忆体孤儿条目（来源指向不存在的 wiki 页）──
-function pruneMemory() {
+// F2：三道保险。这是全项目唯一会**批量删除持久化数据**的操作，而它判定「孤儿」的唯一依据
+// 是「vault 里找不到这个文件」—— vault 没挂载时，这个判断会把整个记忆体判成孤儿。
+function pruneMemory(pages, { force = FORCE, dry = DRY } = {}) {
+  // 保险 1：vault 结构性健康。硬停，--force 也不能越过 —— 路径都不对时「删除」没有任何依据。
+  const problems = vaultHealth();
+  if (problems.length) {
+    return { skipped: true, reason: "vault 不健康，拒绝软删: " + problems.join("; ") };
+  }
+  // 保险 2：页面数下限。挂载缺失 / 路径配错时 wiki/ 会是空的或近乎空的。
+  const n = Array.isArray(pages) ? pages.length : 0;
+  if (n < PRUNE_MIN_PAGES && !force) {
+    return { skipped: true, reason: `wiki 页面数 ${n} < ${PRUNE_MIN_PAGES}，疑似 vault 未挂载，拒绝软删（--force 可覆盖）` };
+  }
+
   let db;
-  try { db = new DatabaseSync(join(homedir(), ".mnemon/data/default/mnemon.db"), { readOnly: false }); }
+  try { db = new DatabaseSync(join(homedir(), ".mnemon/data/default/mnemon.db"), { readOnly: true }); }
   catch (e) { return { error: "无法打开 mnemon db: " + e.message }; }
   try {
     const rows = db.prepare("SELECT id, content FROM insights WHERE content LIKE ? AND deleted_at IS NULL").all("%来源: wiki/%");
-    let pruned = 0;
+    const victims = [];
     const gone = [];
     for (const r of rows) {
       const m = String(r.content).match(/来源: ([^）)]+)/);
       if (!m) continue;
       const rel = m[1].trim();
-      if (!existsSync(join(VAULT, rel))) {
-        // 软删（mnemon 的 deleted_at 机制）
-        db.prepare("UPDATE insights SET deleted_at = ? WHERE id = ?").run(new Date().toISOString(), r.id);
-        pruned++;
-        gone.push(rel);
-      }
+      const inside = safeJoinVault(rel, VAULT, { mustExist: false });
+      const alive = inside ? existsSync(inside.full) : false;
+      if (!alive) { victims.push(r.id); gone.push(rel); }
     }
-    return { scanned: rows.length, pruned, gone: gone.slice(0, 8) };
-  } finally { try { db.close(); } catch {} }
+    // 保险 3：单次删除比例。路径配错时「全部都不存在」，比例会冲到 100%。
+    if (rows.length > 0 && victims.length / rows.length > PRUNE_MAX_RATIO && !force) {
+      return {
+        skipped: true, scanned: rows.length, wouldPrune: victims.length,
+        reason: `待删 ${victims.length}/${rows.length} 超过 ${Math.round(PRUNE_MAX_RATIO * 100)}%，疑似路径配错，拒绝软删（--force 可覆盖）`,
+      };
+    }
+    if (dry) return { scanned: rows.length, pruned: 0, wouldPrune: victims.length, gone: gone.slice(0, 8), note: "(--dry-run) 未写入" };
+    // 三重保险都通过后才开写 —— 上面用 readOnly 打开，避免在只读检查阶段就持有写锁。
+    db.close();
+    db = null;
+    try { db = new DatabaseSync(join(homedir(), ".mnemon/data/default/mnemon.db"), { readOnly: false }); }
+    catch (e) { return { error: "无法以写模式打开 mnemon db: " + e.message }; }
+    const stamp = new Date().toISOString();
+    for (const id of victims) db.prepare("UPDATE insights SET deleted_at = ? WHERE id = ?").run(stamp, id);
+    return { scanned: rows.length, pruned: victims.length, gone: gone.slice(0, 8) };
+  } finally { try { if (db) db.close(); } catch {} }
 }
 
 function collectPages() {
@@ -700,6 +787,21 @@ async function main() {
     if (r.ok && !DRY) appendLog("rate:" + RATE_TARGET + "=" + RATE_VALUE);
     return;
   }
+
+  // F2 总闸：vault 不健康时所有阶段都无意义，且部分阶段是有害的 ——
+  //   --index 会用空内容覆盖 wiki/index.md（而 index.md 每轮被注入系统提示词），
+  //   --compile-patterns 会在根文件系统上 mkdir 出幽灵 vault 树，
+  //   --prune-memory 会把整个记忆体判成孤儿。
+  // 之前没有任何一处检查 vault 是否存在，所以「D 盘没挂载」会安静地造成上述全部后果。
+  const problems = vaultHealth();
+  if (problems.length) {
+    console.log("\n[中止] vault 不健康，跳过全部阶段：");
+    for (const p of problems) console.log("  -", p);
+    console.log("  检查: D 盘是否挂载 / LLM_WIKI_VAULT 是否指向正确的 vault 根目录。");
+    process.exitCode = 3;   // 与 install.sh 的 vault 预检失败保持同一退出码，便于 systemd 标红
+    return;
+  }
+
   const pages = collectPages();
   console.log("页面数:", pages.length);
   const summary = [];
@@ -713,9 +815,16 @@ async function main() {
     summary.push("lint:" + r.issues.length + "问题/" + r.orphans.length + "孤立/" + r.stale.length + "stale");
   }
   if (RUN.index) {
-    const md = rebuildIndex(pages);
-    if (!DRY) { writeFileSync(join(WIKI, "index.md"), md); console.log("\n== index ==\n已重建 wiki/index.md"); summary.push("index:重建"); }
-    else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md");
+    // F2：index.md 每轮被插件注入系统提示词，用空内容覆盖它 = 把模型的 vault 认知清零。
+    // 页面数为 0 时宁可不动，也不要把一份看起来正常的空索引写回去。
+    if (pages.length === 0) {
+      console.log("\n== index ==\n[跳过] wiki 页面数为 0，拒绝用空内容覆盖 index.md");
+      summary.push("index:跳过(空)");
+    } else {
+      const md = rebuildIndex(pages);
+      if (!DRY) { writeFileSync(join(WIKI, "index.md"), md); console.log("\n== index ==\n已重建 wiki/index.md"); summary.push("index:重建"); }
+      else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md");
+    }
   }
   if (RUN.usage) {
     console.log("\n== usage ==");
@@ -735,7 +844,7 @@ async function main() {
   if (RUN.compilePatterns) {
     console.log("\n== compile-patterns ==");
     if (DRY) console.log("(--dry-run) 将扫描孤立节点并生成 pattern 页");
-    else { const r = compilePatterns(pages); console.log("编译:", JSON.stringify(r)); summary.push("compile:" + (r.created || 0) + "pattern/"); }
+    else { const r = compilePatterns(pages); console.log("编译:", JSON.stringify(r)); summary.push(r.skipped ? "compile:跳过" : "compile:" + (r.created || 0) + "pattern/"); }
   }
   if (RUN.docs) {
     console.log("\n== docs-sync ==");
@@ -749,8 +858,9 @@ async function main() {
   }
   if (RUN.prune) {
     console.log("\n== prune-memory ==");
-    if (DRY) console.log("(--dry-run) 将软删来源指向不存在 wiki 页的记忆体条目");
-    else { const r = pruneMemory(); console.log("清理:", JSON.stringify(r)); summary.push("prune:" + (r.pruned || 0) + "条"); }
+    const r = pruneMemory(pages);
+    console.log("清理:", JSON.stringify(r));
+    if (!DRY) summary.push(r.skipped ? "prune:跳过" : "prune:" + (r.pruned || 0) + "条");
   }
   if (RUN.sync) {
     console.log("\n== sync ==");

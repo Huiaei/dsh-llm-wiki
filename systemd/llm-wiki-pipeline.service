@@ -1,8 +1,30 @@
 [Unit]
-Description=LLM-Wiki 后处理管线（lint + 索引 + 记忆体同步）
+Description=LLM-Wiki 后处理管线（lint + 索引 + OKF + 记忆体同步）
 After=network.target
 
 [Service]
 Type=oneshot
+# F3: --all 现在只跑六个安全阶段（lint/index/okf/usage/docs-sync/sync）。
+# 破坏性阶段（--prune-memory / --dsh-export）与 --compile-patterns 需要显式点名。
 ExecStart=/usr/bin/node %h/bin/llm-wiki-pipeline.mjs --all
 UMask=077
+
+# ── F7-6: systemd 沙箱 ──
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 说明：这里刻意不用 ProtectSystem=strict / ProtectHome=read-only。
+# 管线合法地要写 ~/.dsh/llm-wiki（state）、~/.mnemon（mnemon import）和 vault 本身，
+# 而这三个路径都可被用户改（LLM_WIKI_VAULT / LLM_WIKI_STATE）。要在单元里放
+# ReadWritePaths 就得把路径写死，任何非默认布局都会以 "read-only file system" 失败。
+# ProtectSystem=full 保护 /usr /boot /etc —— 管线没有任何理由写这三处。

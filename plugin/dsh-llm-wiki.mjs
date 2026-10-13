@@ -15,13 +15,19 @@
 import { readFileSync, statSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { homedir } from "node:os";
 
 export const name = "dsh-llm-wiki";
 export const inject = ["systemPrompt"];
 
 const DEFAULT_VAULT = "/mnt/d/DB/Obsidian/LLM-Wiki";
-const PIPELINE = process.env.HOME + "/bin/llm-wiki-pipeline.mjs";
+// F3/M6：原来用 process.env.HOME 拼接，HOME 未设时会得到 "undefined/bin/llm-wiki-pipeline.mjs"
+const PIPELINE = process.env.LLM_WIKI_PIPELINE || join(homedir(), "bin", "llm-wiki-pipeline.mjs");
 const CACHE_TTL = 60_000; // 读文件缓存 60s
+
+// F3：只点名安全阶段，不用 --all。--all 现在也只跑安全阶段，但显式列出可以防止
+// 「将来往 --all 里加阶段时，插件在不知情的情况下跟着跑」—— 这个钩子每 60s 就有机会触发。
+const SAFE_STAGES = ["--lint", "--index", "--okf", "--usage", "--sync"];
 
 function cached(file, ttl = CACHE_TTL) {
   let last = 0, data = "";
@@ -74,11 +80,17 @@ export function apply(ctx, config = {}) {
 
   const runPipeline = () => {
     if (running) return;
+    // F3：预校验。原来只在 spawn 的 error 回调里报错，而 detached + stdio:"ignore"
+    // 会把「管线不存在」变成一个每 60s 重复一次、无人看见的静默失败。
+    if (!existsSync(PIPELINE)) {
+      try { console.log("[dsh-llm-wiki] 管线不存在，跳过: " + PIPELINE); } catch {}
+      return;
+    }
     const now = Date.now();
     if (now - lastRun < COOLDOWN_MS) return;
     running = true;
     lastRun = now;
-    const child = spawn(process.execPath, [PIPELINE, "--all"], {
+    const child = spawn(process.execPath, [PIPELINE, ...SAFE_STAGES], {
       stdio: "ignore",
       detached: true,
     });
@@ -93,7 +105,15 @@ export function apply(ctx, config = {}) {
     child.unref();
   };
 
+  // F3：延迟 5s + 单次。会话销毁瞬间可能有多个 disposed 事件，而且此时管线会与正在收尾的
+  // 进程抢 IO。原来的实现每个事件都立刻 spawn 一次，只有进程内 60s 冷却兜底。
+  let timer = null;
   ctx.on("session/disposed", () => {
-    try { runPipeline(); } catch (e) { try { console.log("[dsh-llm-wiki] hook error: " + e.message); } catch {} }
+    if (timer) return;                        // 已有排队的触发 → 忽略后续事件
+    timer = setTimeout(() => {
+      timer = null;
+      try { runPipeline(); } catch (e) { try { console.log("[dsh-llm-wiki] hook error: " + e.message); } catch {} }
+    }, 5000);
+    if (typeof timer.unref === "function") timer.unref();
   });
 }

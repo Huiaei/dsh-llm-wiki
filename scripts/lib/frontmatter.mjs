@@ -191,6 +191,22 @@ export function setFmSeq(content, field, items) {
   return setFmRaw(content, field, "\n" + body);
 }
 
+/** 删除字段（连同它的块序列 / 块映射续行）。字段不存在时原样返回。
+ *  与 setFmRaw 同样的块感知：只删单行会把 `  - ...` 续行留成孤儿，下次解析报错。 */
+export function deleteFmField(content, field) {
+  const blk = extractFmText(content);
+  if (!blk) return content;
+  const lines = blk.fm.split("\n");
+  const re = new RegExp("^" + field + ":");
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) { if (re.test(lines[i])) { idx = i; break; } }
+  if (idx < 0) return content;
+  let j = idx + 1;
+  while (j < lines.length && /^\s+\S/.test(lines[j])) j++;   // 吃掉续行；空行不吞
+  const newLines = [...lines.slice(0, idx), ...lines.slice(j)];
+  return content.slice(0, blk.start + 3) + newLines.join("\n") + "\n---" + content.slice(blk.end + 4);
+}
+
 /** 需要结构化的字段及其期望形状（用于旧文件的一次性规范化） */
 export const STRUCTURED_FIELDS = {
   tags: "array",

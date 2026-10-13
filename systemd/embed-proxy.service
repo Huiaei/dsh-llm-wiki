@@ -8,5 +8,31 @@ Restart=always
 RestartSec=5
 UMask=077
 
+# ── F7-6: systemd 沙箱 ──
+# 这个进程只做一件事：读 ~/.modlens/config.json 取 key，然后监听一个本地端口转发到
+# api.siliconflow.cn。它不需要写任何文件、不需要设备、不需要内核接口。
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6
+# 注意：不要加 MemoryDenyWriteExecute=yes —— 它会让 V8 的 JIT 无法申请 W+X 内存，
+# node 直接启动失败。这条在方案原文里被列为加固项，实际不可用于 Node。
+#
+# F6 悬置项：把代理从 11434 挪到 11500 需要 mnemon 支持 OLLAMA_HOST 指向新端口，
+# 而这一点未经验证。在确认之前保持 11434，否则 mnemon 会找不到 embedding 端点。
+# 确认后取消下一行注释，并同步配置 mnemon。
+# Environment=EMBED_PORT=11500
+
 [Install]
 WantedBy=default.target

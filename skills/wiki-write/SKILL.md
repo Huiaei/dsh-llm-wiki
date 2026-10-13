@@ -1,6 +1,6 @@
 ---
 name: wiki-write
-description: 向 LLM-Wiki 知识库（/mnt/d/DB/Obsidian/LLM-Wiki）写入新知识。当会话中学到新知识、做出决策、发现踩坑经验、用户要求记录/保存知识到 wiki 时使用。写入纪律：先查重、选对分类、frontmatter 完整、wikilink>=2、中文标题。
+description: 向 LLM-Wiki 知识库（{{VAULT}}）写入新知识。当会话中学到新知识、做出决策、发现踩坑经验、用户要求记录/保存知识到 wiki 时使用。写入纪律：先查重、选对分类、frontmatter 完整、wikilink>=2、中文标题。
 ---
 
 # LLM-Wiki 知识写入
@@ -62,6 +62,7 @@ cssclasses: [<分类>]
 
 ## 写入后
 
-- 管线脚本（~/bin/llm-wiki-pipeline，或会话结束自动触发）会执行：lint → 索引重建 → 记忆体同步（新页面进 mnemon recall）。
+- 管线脚本（~/bin/llm-wiki-pipeline，或会话结束自动触发）会执行安全阶段：lint → 索引重建 → OKF 字段补齐 → 召回热度回写 → 记忆体同步（新页面进 mnemon recall）。
+- 破坏性阶段**不会**被自动触发，需要显式点名：`--prune-memory`（软删来源已消失的记忆体条目）、`--dsh-export`（把会话复盘落盘到 raw/）、`--compile-patterns`（生成 pattern 页）。
 - 若管线未运行，可手动提醒用户运行，或告知"会话结束后自动处理"。
 - 质量反馈闭环：用户评价页面有用/过时 → `node ~/bin/llm-wiki-pipeline.mjs --rate <路径> --rating useful|outdated`（useful 升 quality_score，outdated 标 stale）；管线 --usage 自动把记忆体召回热度回写 queried_count。

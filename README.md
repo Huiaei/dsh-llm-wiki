@@ -42,14 +42,20 @@
 **方式 A：bundle 包（推荐，含插件）**
 
 ```bash
-dsh plugin --profile web add github:iwtown/dsh-llm-wiki
+# F7-7：固定到具体 commit，不要跟分支。插件运行在 dsh-web 进程内、能读整个 vault
+# 并把内容注入系统提示词 —— 它不是「装坏了删掉就行」的东西，而跟分支意味着
+# 上游任何一次推送都会自动进入你的 dsh-web 进程。
+dsh plugin --profile web add "github:iwtown/dsh-llm-wiki#<commit-sha>"
 ```
 
 然后安装 SKILL / 管线 / systemd 服务（install.sh 只做这一步也行）：
 
 ```bash
 git clone https://github.com/iwtown/dsh-llm-wiki.git
-cd dsh-llm-wiki && ./install.sh
+cd dsh-llm-wiki
+git checkout <commit-sha>          # 与上面保持一致
+./install.sh --dry-run             # 先看要做什么，不写任何文件
+./install.sh --vault /path/to/vault
 systemctl --user restart dsh-web   # 让插件生效
 ```
 
@@ -61,41 +67,77 @@ cd dsh-llm-wiki && ./install.sh
 systemctl --user restart dsh-web
 ```
 
-`install.sh` 会把各组件复制到标准位置并启用 systemd 服务。然后：
+`install.sh` 参数：
 
-1. **配置 vault 路径**：默认 /mnt/d/DB/Obsidian/LLM-Wiki（管线可用环境变量 LLM_WIKI_VAULT 覆盖；插件在 cordis.patch.yml 的 config.vault 覆盖；**SKILL 文件中的路径需按本机修改**）
-2. **首次记忆体同步**：`node ~/bin/llm-wiki-pipeline.mjs --sync`（把 wiki 精华导入 mnemon）
-3. **可选向量**：确认 embed-proxy 服务运行后 `mnemon embed --all` 补齐向量
+| 参数 | 说明 |
+|---|---|
+| `--vault PATH` | vault 根目录（默认 `$LLM_WIKI_VAULT`，再默认 `/mnt/d/DB/Obsidian/LLM-Wiki`） |
+| `--dry-run` | 只打印将要做的事，不写任何文件 |
+| `--enable-services` | 同时启用 systemd 用户服务（**默认只安装单元文件，不启用**） |
+
+脚本做的事：
+
+1. **预检 vault**：目录不存在则打印原因并 `exit 3`，不创建任何文件。
+2. **替换 SKILL 里的 `{{VAULT}}`** 为 `--vault` 指定的路径，并把同一路径写进 `cordis.patch.yml` 的 `config.vault`。
+3. 追加 `cordis.patch.yml` 前**先备份**，并确保原文件以换行结尾（否则追加的 `- insert:` 会与上一行粘连成 `key: value- insert:`，整个 YAML 损坏）。
+4. 复制 `scripts/lib/*.mjs` 到 `~/bin/lib/`（管线在 O1/O2 后 import 这两个文件，漏掉会在运行时 `ERR_MODULE_NOT_FOUND`）。
+
+然后：
+
+1. **配置 vault 路径**：`--vault` 已同时写入插件配置与 SKILL；管线可用环境变量 `LLM_WIKI_VAULT` 覆盖
+2. **自检**：`node ~/bin/llm-wiki-pipeline.mjs --all --dry-run`（零写入）
+3. **首次记忆体同步**：`node ~/bin/llm-wiki-pipeline.mjs --sync`（把 wiki 精华导入 mnemon）
+4. **可选向量**：确认 embed-proxy 服务运行后 `mnemon embed --all` 补齐向量
 
 ## 使用
 
 - **写入知识**：直接说"把这个记到知识库"，模型按 wiki-write 技能写入对应分类
 - **检索知识**：问"之前怎么做的"，模型按 wiki-search 技能检索并引用原文
-- **手动管线**：`node ~/bin/llm-wiki-pipeline.mjs --all`
+- **手动管线**：`node ~/bin/llm-wiki-pipeline.mjs --all`（安全阶段；破坏性阶段需点名，见下）
 - **质量反馈**：`node ~/bin/llm-wiki-pipeline.mjs --rate wiki/决策/xxx.md --rating useful|outdated`
+  - 路径必须是 vault 根下的相对路径且以 `wiki/` 开头：管线会拒绝越界路径（含 `../`、绝对路径）、经符号链接指向 vault 外的路径，以及 `raw/` 与会话导出（它们不是知识页）。
+  - `outdated` 会同时**撤销该页的 `verified` 标记** —— 页面既被判为过时，自动核验的结论也随之失效。
 
 ### 管线路由
 
 ```bash
+# 安全阶段 —— --all 现在只跑这些（零破坏性）
 node ~/bin/llm-wiki-pipeline.mjs --lint          # frontmatter 完整性 + YAML 子集校验 + type↔目录 + related 悬空链接 + stale 报告
 node ~/bin/llm-wiki-pipeline.mjs --okf           # OKF v0.2 字段补齐 + 旧字符串字段规范化为受控子集 YAML（幂等）
-node ~/bin/llm-wiki-pipeline.mjs --compile-patterns  # 从孤立节点聚类生成 pattern 页
-node ~/bin/llm-wiki-pipeline.mjs --index         # 重建导航页
+node ~/bin/llm-wiki-pipeline.mjs --index         # 重建导航页（页面数为 0 时拒绝覆盖）
 node ~/bin/llm-wiki-pipeline.mjs --sync          # 变更同步到 mnemon 记忆体
 node ~/bin/llm-wiki-pipeline.mjs --usage         # 回写召回热度到 frontmatter
-node ~/bin/llm-wiki-pipeline.mjs --dsh-export    # 导出 DSH 会话到 raw/sessions/dsh/
-node ~/bin/llm-wiki-pipeline.mjs --all           # 全量执行（含 --prune-memory）
+node ~/bin/llm-wiki-pipeline.mjs --docs-sync     # mnemon Documents 回流为 wiki 页
+node ~/bin/llm-wiki-pipeline.mjs --all           # 上述安全阶段
 node ~/bin/llm-wiki-pipeline.mjs --all --dry-run # 预览模式（零写入）
+
+# 破坏性 / 显式阶段 —— 不再隐含在 --all 里，必须点名
+node ~/bin/llm-wiki-pipeline.mjs --prune-memory     # 软删来源已消失的记忆体条目（三重保险，见下）
+node ~/bin/llm-wiki-pipeline.mjs --dsh-export       # 导出 DSH 会话到 raw/sessions/dsh/
+node ~/bin/llm-wiki-pipeline.mjs --compile-patterns # 从孤立节点聚类生成 pattern 页
 ```
+
+`--prune-memory` 是全项目唯一会**批量删除持久化数据**的操作，它判定「孤儿」的唯一依据是
+「vault 里找不到这个文件」—— 挂载缺失时这个判断会把整个记忆体判成孤儿。三道保险任一触发即拒绝：
+
+| 保险 | 触发条件 | 对应现实 |
+|---|---|---|
+| vault 健康 | vault 或 `wiki/` 不存在 | 路径都不对时「删除」没有依据（`--force` 也不能越过这道） |
+| 页面数下限 | wiki 页面数 < 10 | 典型原因是 D 盘未挂载 |
+| 待删比例 | 待删 > 20% | 典型原因是路径配错，于是「全部页面都不存在」 |
+
+vault 不健康时，管线会中止全部阶段、只输出诊断，并返回**退出码 3**（与 `install.sh` 的 vault 预检失败一致）。
 
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| LLM_WIKI_VAULT | /mnt/d/DB/Obsidian/LLM-Wiki | vault 路径 |
+| LLM_WIKI_VAULT | /mnt/d/DB/Obsidian/LLM-Wiki | vault 路径（不存在时管线中止并返回退出码 3） |
 | LLM_WIKI_STATE | ~/.dsh/llm-wiki/pipeline-state.json | 管线增量状态文件（schema 2：存语义指纹；旧版 mtime 状态会被识别为过期并触发一次全量重算） |
+| LLM_WIKI_PIPELINE | ~/bin/llm-wiki-pipeline.mjs | 插件触发的管线脚本路径 |
 | EMBED_KEY | 读 ~/.modlens/config.json | SiliconFlow API key |
 | EMBED_MODEL | BAAI/bge-m3 | 向量模型 |
+| EMBED_PORT | 11434 | embed-proxy 监听端口（挪到 11500 需 mnemon 支持 OLLAMA_HOST，未验证） |
 
 ## wiki 结构
 
