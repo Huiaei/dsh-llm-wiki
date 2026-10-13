@@ -21,7 +21,8 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "build:converters": "bash scripts/build-converters.sh"
   },
   "dsh": {
     "bundle": {

@@ -94,6 +94,7 @@ systemctl --user restart dsh-web
 - **写入知识**：直接说"把这个记到知识库"，模型按 wiki-write 技能写入对应分类
 - **检索知识**：问"之前怎么做的"，模型按 wiki-search 技能检索并引用原文
 - **手动管线**：`node ~/bin/llm-wiki-pipeline.mjs --all`（安全阶段；破坏性阶段需点名，见下）
+- **摄取外部文档**：`node ~/bin/wiki-convert.mjs 文件.html --inbox "$VAULT/raw/inbox" --sources "$VAULT/raw/sources"`，再由模型按 wiki-write 落位（见下）
 - **质量反馈**：`node ~/bin/llm-wiki-pipeline.mjs --rate wiki/决策/xxx.md --rating useful|outdated`
   - 路径必须是 vault 根下的相对路径且以 `wiki/` 开头：管线会拒绝越界路径（含 `../`、绝对路径）、经符号链接指向 vault 外的路径，以及 `raw/` 与会话导出（它们不是知识页）。
   - `outdated` 会同时**撤销该页的 `verified` 标记** —— 页面既被判为过时，自动核验的结论也随之失效。
@@ -128,6 +129,47 @@ node ~/bin/llm-wiki-pipeline.mjs --compile-patterns # 从孤立节点聚类生�
 
 vault 不健康时，管线会中止全部阶段、只输出诊断，并返回**退出码 3**（与 `install.sh` 的 vault 预检失败一致）。
 
+### 文档摄取（可选）
+
+外部文档不进 `wiki/`，先落到**暂存区**，再由模型按 wiki-write 落位。转换是**独立进程**，
+不是插件内的函数调用 —— 一个 PDF 解析器崩溃不该带走整个 dsh-web 会话。
+
+```bash
+node ~/bin/wiki-convert.mjs 文件.html \
+  --inbox "$VAULT/raw/inbox" --sources "$VAULT/raw/sources" --json
+```
+
+| 路径 | 内容 |
+|---|---|
+| `raw/inbox/<sha256 前 16 位>.md` | 转换产物（待模型落位） |
+| `raw/sources/<sha256>.<ext>` | 原件，`fidelity: lossy` 时必需 |
+
+产物 frontmatter 的七个必填字段：`title` / `source` / `sha256` / `original_name` /
+`converted_by`（**必须带版本号**，如 `convert-html@0.1.0`）/ `converted_at` / `fidelity`。
+`converted_by` 带版本号是为了将来能精确找出「哪些页是旧工具转的」**只重转那一批** ——
+无差别重跑会覆盖模型在落位时写进去的分类、标题与 wikilink，等于把写时语义工作白做一遍。
+
+**四条硬约束**：
+
+1. **身份是原件的哈希，不是产物的哈希。** 用产物哈希去重，会让「同一份 PDF 转两次」变成两个文档。
+2. **非 0 退出不留文件。** 转换器自己 `tmp + rename`，调度器再按目录 diff 兜底 —— 连 `kill -9` 也不会留下半截产物。
+3. **`fidelity: lossy` 必须留原件。** 原件是唯一的**验证 oracle**：转录错 5% 没有任何 diff 能发现，原件删掉就永久不可复证。
+4. **转换器不写 `wiki/`。** 它不认识 11 个分类，硬猜会撞 `type_dir` 校验；分类与标题由模型在落位时决定。
+
+`fidelity` 由转换器按**输入格式**声明，**不由模型自评** —— 模型说「我已完整覆盖」是不可审计的，
+按格式查表才是确定性、可测、可复现的。
+
+| 输入格式 | fidelity | 原件 |
+|---|---|---|
+| 纯文本 / markdown / 源码 | `lossless` | 可弃 |
+| HTML / 网页正文 | `lossy`（样式丢弃） | 保留，或保留 URL |
+| DOCX / PPTX / XLSX、PDF（文字版） | `lossy`（版式、公式、批注、表格结构） | 保留 |
+| PDF（扫描件）、图片 / 截图、音视频 | `lossy`（OCR / 描述错误率不可忽略） | 必须保留 |
+
+**现有转换器**：`convert-html`（Go，静态单文件，约 3.7 MB）。
+构建：`npm run build:converters`（或 `bash scripts/build-converters.sh`）。
+产物 `converters/bin/` 不进版本库。
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -138,6 +180,7 @@ vault 不健康时，管线会中止全部阶段、只输出诊断，并返回**
 | EMBED_KEY | 读 ~/.modlens/config.json | SiliconFlow API key |
 | EMBED_MODEL | BAAI/bge-m3 | 向量模型 |
 | EMBED_PORT | 11434 | embed-proxy 监听端口（挪到 11500 需 mnemon 支持 OLLAMA_HOST，未验证） |
+| LLM_WIKI_CONVERTERS | （未设） | 转换器搜索目录，优先于 `converters/bin/` 与 `~/bin` |
 
 ## wiki 结构
 
