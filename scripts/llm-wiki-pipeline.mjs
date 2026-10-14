@@ -5,7 +5,7 @@
  * 用法: node llm-wiki-pipeline.mjs [--lint] [--index] [--sync] [--all] [--dry-run]
  */
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, rmSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, dirname } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -17,11 +17,8 @@ import { STATE_SCHEMA, pageHashes, changedPages, stateEntry, trustTier, isRetire
 import { safeJoinVault, isInside } from "./lib/paths.mjs";
 import { safeTitle, isSuspiciousTitle } from "./lib/sanitize.mjs";
 import { redactSecrets, capLogLines } from "./lib/redact.mjs";
+import { acquireLock, releaseLock, atomicWrite, safeWritePage, lockHolder } from "./lib/pipeline-io.mjs";
 const execFileAsync = promisify(execFile);
-
-// 管道截断（如 head 关闭）不崩溃：忽略 stdout/stderr 的 EPIPE
-process.stdout.on("error", () => {});
-process.stderr.on("error", () => {});
 
 // 管道截断（如 head 关闭）不崩溃：忽略 stdout/stderr 的 EPIPE
 process.stdout.on("error", () => {});
@@ -140,7 +137,7 @@ function ratePage(rel, rating, { dry = DRY } = {}) {
     content = setFmField(content, "last_queried", today);
     if (fm.status === "stale") content = setFmField(content, "status", "active");
     if (dry) return { ok: true, rel: hit.rel, score: Math.min(cur + 1, 5), note: "(--dry-run) 未写入" };
-    writeFileSync(full, content);
+    atomicWrite(full, content);
     return { ok: true, rel: hit.rel, score: Math.min(cur + 1, 5), note: "useful 反馈，quality_score 提升" };
   }
   if (rating === "outdated") {
@@ -152,7 +149,7 @@ function ratePage(rel, rating, { dry = DRY } = {}) {
     // 否则 okfAlign 写的 verified 会永久留在页面上，继续把它伪装成「已验证内容」。
     content = deleteFmField(content, "verified");
     if (dry) return { ok: true, rel: hit.rel, score: Math.max(cur - 1, 0), note: "(--dry-run) 未写入" };
-    writeFileSync(full, content);
+    atomicWrite(full, content);
     return { ok: true, rel: hit.rel, score: Math.max(cur - 1, 0), note: "outdated 反馈，标记 stale 并撤销 verified" };
   }
   return { error: "rating 必须是 useful 或 outdated" };
@@ -160,6 +157,8 @@ function ratePage(rel, rating, { dry = DRY } = {}) {
 
 // --usage: 从 mnemon 记忆体提取召回热度，回写 queried_count/last_queried
 function usageSync(pages) {
+  const conflicts = [];   // O3
+  const errors = [];
   let db;
   try { db = new DatabaseSync(join(homedir(), ".mnemon/data/default/mnemon.db"), { readOnly: true }); }
   catch (e) { return { error: "无法打开 mnemon db: " + e.message }; }
@@ -185,14 +184,16 @@ function usageSync(pages) {
         content = setFmField(content, "queried_count", u.count);
         if (u.last) content = setFmField(content, "last_queried", u.last);
         if (content !== p.content) {
-          writeFileSync(p.full, content);
+          const w = safeWritePage(p, content);
+          if (w.skipped) { conflicts.push(p.rel); continue; }
+          if (w.error) { errors.push(p.rel + ": " + w.error); continue; }
           // O2：不再伪装 mtime。queried_count/last_queried 不进 draft 指纹，所以本来就不会触发重同步。
           refreshPage(p);
           updated++;
         }
       }
     }
-    return { tracked: rows.length, updated };
+    return { tracked: rows.length, updated, conflicts, errors };
   } finally { try { db.close(); } catch {} }
 }
 
@@ -200,6 +201,8 @@ function usageSync(pages) {
 function okfAlign(pages) {
   let updated = 0, aligned = 0, repaired = 0;
   const repairSample = [];
+  const conflicts = [];   // O3：本轮被外部改过、我们主动放弃写的页
+  const errors = [];
   for (const p of pages) {
     if (p.cat === "索引") continue;
     let content = p.content;
@@ -270,13 +273,18 @@ function okfAlign(pages) {
       }
     }
     if (content !== p.content) {
+      // O3：写前复查 mtime。这一轮刚开始时 collectPages() 记下了 p.mtime；若 Obsidian
+      // 在两次阶段之间编辑过同一页，stat 对不上就跳过——宁可少补一个 description，
+      // 也不能把用户刚写的正文冲掉。
+      const w = safeWritePage(p, content);
+      if (w.skipped) { conflicts.push(p.rel); continue; }
+      if (w.error) { errors.push(p.rel + ": " + w.error); continue; }
       // O2：不再恢复 mtime。--okf 补的 description 进 draft 指纹 → 这一轮就该同步，而不是永不
-      writeFileSync(p.full, content);
       refreshPage(p);
       updated++; aligned++;
     }
   }
-  return { aligned, updated, repaired, repairSample };
+  return { aligned, updated, repaired, repairSample, conflicts, errors };
 }
 
 
@@ -336,7 +344,7 @@ function compilePatterns(pages) {
         existing = existing.slice(0, insertAt) + appendLine + "\n" + existing.slice(insertAt);
       }
       existing = existing.replace(/^updated: .+$/m, "updated: " + today);
-      writeFileSync(patternFile, existing);
+      atomicWrite(patternFile, existing);
       logEntries.push("* **Pattern 更新**: [[wiki/patterns/" + patternName + "]] \u2014 追加 " + ps.length + " 条新证据");
     } else {
       const rl = ps.slice(0, 3).map(pp => "  - \"[[" + pp.rel + "]]\"").join("\n");
@@ -371,7 +379,7 @@ function compilePatterns(pages) {
         "## 衍生技能",
         "- --",
       ];
-      writeFileSync(patternFile, parts.join("\n"));
+      atomicWrite(patternFile, parts.join("\n"));
       created.push(patternName);
       logEntries.push("* **Pattern 新增**: [[wiki/patterns/" + patternName + "]] \u2014 从 " + ps.length + " 个 " + typ + " 孤立页聚类（关键词: " + topKeywords.join(", ") + "）");
     }
@@ -410,7 +418,7 @@ function compilePatterns(pages) {
         + "## " + today + "\n" + logEntries.join("\n") + "\n";
     }
     // F8：封顶。两个整段都来自 newest-first 的插入点，所以保留头部（最新）即可。
-    writeFileSync(logsFile, capLogLines(lc).text);
+    atomicWrite(logsFile, capLogLines(lc).text);
   }
   return { created: created.length, orphans: orphanPages.length, patterns: created };
 }
@@ -430,7 +438,7 @@ const DSH_SESSIONS = join(homedir(), ".dsh/sessions");
 const DSH_EXPORT_ENABLED = process.env.LLM_WIKI_EXPORT_SESSIONS === "1";
 // ② 默认写到 ~/.dsh/llm-wiki/ 下，**不落 vault**。vault 在 /mnt/d —— Windows 可写、
 //    可能被 Obsidian 同步或共享，把对话全文放进去等于扩大了泄露面。
-const DSH_EXPORT_DIR = process.env.LLM_WIKI_EXPORT_DIR || join(STATE_DIR, "sessions-export");
+const DSH_EXPORT_DIR = process.env.LLM_WIKI_EXPORT_DIR || join(dirname(STATE_FILE), "sessions-export");
 // ③ 只导最近一段，不再「全历史静默导出」。这是「逐会话同意」在 CLI 语言里的替代品。
 const DSH_EXPORT_DEFAULT_DAYS = 7;
 const DSH_EXPORT_DEFAULT_LIMIT = 20;
@@ -515,7 +523,7 @@ function dshSessionExport() {
   let warnedInVault = false;
   try {
     if (isInside(outDir, VAULT)) {
-      writeFileSync(join(outDir, ".no-sync"), "此目录含 DSH 会话全文，请把它排除出 Obsidian / 网盘同步。\n");
+      atomicWrite(join(outDir, ".no-sync"), "此目录含 DSH 会话全文，请把它排除出 Obsidian / 网盘同步。\n");
       warnedInVault = true;
     }
   } catch {}
@@ -559,7 +567,7 @@ function dshSessionExport() {
       const md = buildSessionMd(c.sd, raw);
       const date = new Date(c.mtimeMs).toISOString().slice(0, 10);
       const dest = join(outDir, date + "-" + c.sd.replace(/^session-/, "").slice(0, 8) + ".md");
-      writeFileSync(dest, md);
+      atomicWrite(dest, md);
       exported[c.sd] = c.mtimeMs;
       exportedNow++;
       results.push(c.sd.slice(0, 16));
@@ -623,7 +631,7 @@ function docsSync() {
       const fname = String(fm.title).replace(/[\\/:*?"<>|]/g, "-").slice(0, 80);
       const md = "---\ntitle: " + JSON.stringify(String(fm.title)) + "\ntags: [wiki/" + cat + ", compiled, mnemon]\ntype: \"" + cat + "\"\ncreated: " + date + "\nupdated: " + date + "\nsource: \"mnemon:document:" + fm.id + "\"\ndescription: " + (fm.description ? JSON.stringify(String(fm.description)) : "\"\"") + "\n---\n\n" + body + "\n\n## 相关\n\n- [[wiki/决策/llm-wiki-架构设计决策]]\n- [[wiki/概念/LLM-Wiki理念]]\n";
       const dest = join(WIKI, cat, fname + ".md");
-      writeFileSync(dest, md);
+      atomicWrite(dest, md);
       imported[f] = fm.content_hash;
       importedNow++;
       existing.add(normTitle);
@@ -823,7 +831,12 @@ function rebuildIndex(pages) {
 }
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
-function saveState(s) { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(STATE_FILE, JSON.stringify(s, null, 1)); }
+// state 也走原子写：半截 JSON 会让下次 loadState 抛异常，而 catch 里返回 {} 会让
+// 整个增量检测退化成「全量重算」——不会崩，但每次都全量。
+// state 也走原子写（半截 JSON 会让 loadState 抛异常 → catch 返回 {} → 增量检测退化成
+// 全量重算，不崩但每次都全量）。目录随 STATE_FILE 走，不钉死 STATE_DIR：LLM_WIKI_STATE
+// 把状态搬到 tmp 时，不该再往真实 HOME 里 mkdir。
+function saveState(s) { mkdirSync(dirname(STATE_FILE), { recursive: true }); atomicWrite(STATE_FILE, JSON.stringify(s, null, 1)); }
 function generateDraft(changed) {
   return changed
     // 已废弃 / 被取代 → 不进召回。
@@ -872,6 +885,8 @@ async function syncMemory(pages) {
   }
   const draft = { schema_version: "1", insights: generateDraft(toSync) };
   const tmp = join(STATE_DIR, "sync-draft-" + Date.now() + ".json");
+  // 刻意不原子写：这是给 mnemon import 的临时文件，写完立刻被外部读走；且 state 目录
+  // 在 ~/.dsh/llm-wiki，用户不会看到它。真异常时留个 tmp 无害（cron 不清理也不涨）。
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(tmp, JSON.stringify(draft, null, 1));
   let fake = null;
@@ -905,8 +920,8 @@ function appendLog(entry) {
   const logPath = join(VAULT, "log.md");
   try {
     const line = "## [" + new Date().toISOString().slice(0, 10) + "] pipeline | " + entry + "\n";
-    if (existsSync(logPath)) writeFileSync(logPath, capLogLines(line + readFileSync(logPath, "utf8")).text);
-    else writeFileSync(logPath, "# LLM-Wiki 操作日志\n\n" + line);
+    if (existsSync(logPath)) atomicWrite(logPath, capLogLines(line + readFileSync(logPath, "utf8")).text);
+    else atomicWrite(logPath, "# LLM-Wiki 操作日志\n\n" + line);
   } catch {}
 }
 
@@ -918,6 +933,26 @@ async function main() {
     if (r.ok && !DRY) appendLog("rate:" + RATE_TARGET + "=" + RATE_VALUE);
     return;
   }
+
+  // O3：跨进程锁。插件（session/disposed）与 systemd timer（每日 10:00 + RandomizedDelaySec
+  // 300s）会各自拉起一份，插件的 60s 冷却只是进程内计数，挡不住跨进程并发。两份同时跑的
+  // 后果不是抛异常，而是互相覆盖 state / 覆盖对方刚 okf 补好的字段 —— 静默劣化。
+  // 只锁 `--rate` 之外的路径：rate 是单文件增量操作，用户手动执行，锁了反而挡正常使用。
+  // 锁跟着 STATE_FILE 的目录走，而不是钉死 STATE_DIR：LLM_WIKI_STATE 已经是「把状态搬到
+  // 别处」的既有旋钮，同一台机器多个 vault / 测试并行跑时，锁必须跟着状态一起搬，否则
+  // 两个互不相干的 vault 会互相拒入。
+  const LOCK_FILE = join(dirname(STATE_FILE), "pipeline.lock");
+  mkdirSync(dirname(LOCK_FILE), { recursive: true });
+  if (!acquireLock(LOCK_FILE)) {
+    const h = lockHolder(LOCK_FILE);
+    console.log("另一个管线实例正在运行" + (h ? "（pid " + h.pid + "，起于 " + h.at + "）" : "") + "，退出。");
+    return;   // 不是错误：并发的正确行为就是让其中一方安静退出
+  }
+  const onExit = () => releaseLock(LOCK_FILE);
+  process.on("exit", onExit);
+  const onSigint = () => { try { releaseLock(LOCK_FILE); } catch {} process.exit(130); };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigint);
 
   // F2 总闸：vault 不健康时所有阶段都无意义，且部分阶段是有害的 ——
   //   --index 会用空内容覆盖 wiki/index.md（而 index.md 每轮被注入系统提示词），
@@ -954,9 +989,9 @@ async function main() {
     } else {
       const { md, stats } = rebuildIndex(pages);
       if (!DRY) {
-        writeFileSync(join(WIKI, "index.md"), md);
+        atomicWrite(join(WIKI, "index.md"), md);
         // F4：这份统计是注入面的全部内容（约 200 字节，无标题）。插件读它，不读 index.md。
-        writeFileSync(join(WIKI, "index-stats.json"), JSON.stringify(stats, null, 2));
+        atomicWrite(join(WIKI, "index-stats.json"), JSON.stringify(stats, null, 2));
         console.log("\n== index ==\n已重建 wiki/index.md + index-stats.json");
         summary.push("index:重建");
       } else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md + index-stats.json");
@@ -965,7 +1000,12 @@ async function main() {
   if (RUN.usage) {
     console.log("\n== usage ==");
     if (DRY) console.log("(--dry-run) 将回写召回热度到 wiki 页 frontmatter");
-    else { const r = usageSync(pages); console.log("回写:", JSON.stringify(r)); summary.push("usage:" + (r.updated || 0) + "页"); }
+    else {
+      const r = usageSync(pages); console.log("回写:", JSON.stringify(r));
+      for (const s of (r.conflicts || [])) console.log("  [外部修改] 跳过", s);
+      for (const s of (r.errors || [])) console.log("  [写入失败]", s);
+      summary.push("usage:" + (r.updated || 0) + "页");
+    }
   }
   if (RUN.okf) {
     console.log("\n== okf ==");
@@ -974,7 +1014,10 @@ async function main() {
       const r = okfAlign(pages);
       console.log("OKF 对齐:", JSON.stringify(r));
       for (const s of (r.repairSample || [])) console.log("  [规范化]", s);
-      summary.push("okf:" + (r.aligned || 0) + "页" + (r.repaired ? "/规范化" + r.repaired : ""));
+      for (const s of (r.conflicts || [])) console.log("  [外部修改] 跳过", s);
+      for (const s of (r.errors || [])) console.log("  [写入失败]", s);
+      summary.push("okf:" + (r.aligned || 0) + "页" + (r.repaired ? "/规范化" + r.repaired : "")
+        + ((r.conflicts && r.conflicts.length) ? "/外部修改跳过" + r.conflicts.length : ""));
     }
   }
   if (RUN.compilePatterns) {
