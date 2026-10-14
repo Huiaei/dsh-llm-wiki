@@ -115,9 +115,9 @@ run mkdir -p "$HOME/bin/lib"
 run cp "$REPO/scripts/llm-wiki-pipeline.mjs" "$HOME/bin/"
 run cp "$REPO/scripts/embed-proxy.mjs" "$HOME/bin/"
 run cp "$REPO/scripts/wiki-convert.mjs" "$HOME/bin/"
-# F7-4: 必须一起装 scripts/lib/。O1/O2 之后管线 import "./lib/frontmatter.mjs" 与
-# "./lib/hash.mjs"，只 cp 单文件会让它在运行时 ERR_MODULE_NOT_FOUND —— 而插件是
-# detached + stdio:"ignore" 启动它的，这个错误没有任何人看得见。
+# F7-4: 必须一起装 scripts/lib/。管线现在 import frontmatter/hash/paths/sanitize/redact/ingest，
+# 只 cp 单文件会让它在运行时 ERR_MODULE_NOT_FOUND —— 而插件是 detached + stdio:"ignore"
+# 启动它的，这个错误没有任何人看得见。
 for f in "$REPO"/scripts/lib/*.mjs; do
   [ -e "$f" ] || continue
   run cp "$f" "$HOME/bin/lib/"

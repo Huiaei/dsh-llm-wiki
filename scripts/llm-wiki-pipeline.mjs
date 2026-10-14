@@ -10,9 +10,13 @@ import { homedir } from "node:os";
 import { execFileSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DatabaseSync } from "node:sqlite";
+// 而 Node ≥22.15 内置 zstdDecompressSync —— 少一个外部依赖，少一种「装了但跑不了」。
+import { zstdDecompressSync } from "node:zlib";
 import { CATS, extractFmText, parseFm, parseFmYaml, setFmField, deleteFmField, repairStructuredFields } from "./lib/frontmatter.mjs";
 import { STATE_SCHEMA, pageHashes, changedPages, stateEntry, trustTier, isRetired, TRUST_IMPORTANCE } from "./lib/hash.mjs";
-import { safeJoinVault } from "./lib/paths.mjs";
+import { safeJoinVault, isInside } from "./lib/paths.mjs";
+import { safeTitle, isSuspiciousTitle } from "./lib/sanitize.mjs";
+import { redactSecrets, capLogLines } from "./lib/redact.mjs";
 const execFileAsync = promisify(execFile);
 
 // 管道截断（如 head 关闭）不崩溃：忽略 stdout/stderr 的 EPIPE
@@ -34,6 +38,13 @@ const STALE_DAYS = 90;
 // 生成目录：由管线自己写，不属于知识分类（F2 用来说明「为什么 wiki/ 为空仍可能是健康的」）
 const GENERATED_DIRS = ["索引", "patterns", "evolution"];
 
+// ── F5：会话导出 —— 默认关闭 + 显式 opt-in + 输出默认迁出 Obsidian vault ──
+// 问题（H5）：`--dsh-export` 把 user/assistant 全文写进 VAULT/raw/sessions/dsh/，
+// 插件每次 session/disposed 都会触发 → 静默、无逐会话同意。而 vault 在 /mnt/d：
+// Windows 可写、可能被 Obsidian 同步或共享。技能文件写着「密钥不入库」，但会话里
+// **粘贴过**的密钥会以「会话复盘」的形式落进同一个 vault —— 规则管得住主动写入，
+// 管不住顺手粘进对话。
+// 三层防线（缺一不可）：
 // ── F2：破坏性操作的保险阈值 ──
 // 原则：宁可不做，不可做错。删错的记忆体没法恢复，漏跑一次只是晚一天。
 const PRUNE_MIN_PAGES = 10;    // wiki 页面数低于此值 → 拒绝批量软删（典型原因：D 盘没挂载）
@@ -370,16 +381,36 @@ function compilePatterns(pages) {
     const existing = existsSync(logsFile) ? readFileSync(logsFile, "utf8") : "";
     const dupCheck = logEntries.every(e => !existing.includes(e));
     if (!dupCheck) { console.log("(--dry-run) 跳过重复日志条目"); return { created: created.length, orphans: orphanPages.length, patterns: created, skipped: "log" }; }
-    let lc = "# 编译日志（Evolution Log）\n\n> 记录 wiki/patterns/ 的编译、合并、归档事件。\n> 格式：* **<类型>**: <详情>\n\n";
+    let lc;
     if (existsSync(logsFile)) {
+      // 已有文件：保留原样，只在今天的标题下插入 —— 别把过去的日志冲掉
       const el = readFileSync(logsFile, "utf8");
       const ip = el.indexOf("## " + today + "\n");
       if (ip >= 0) {
         const nn = el.indexOf("\n", ip);
         lc = el.slice(0, nn + 1) + "\n" + logEntries.join("\n") + "\n" + el.slice(nn + 1);
-      } else { lc += "## " + today + "\n" + logEntries.join("\n") + "\n"; }
-    } else { lc += "## " + today + "\n" + logEntries.join("\n") + "\n"; }
-    writeFileSync(logsFile, lc);
+      } else {
+        // 头部是标题块（# 编译日志 … 格式说明）。新日期段要落在说明之后、更早日段之前。
+        // 找不到任何日段（fixture 是纯条目堆积）时，退到标题块末尾 —— **不能退到 el.length**：
+        // 那会把今天的新条目拼到全文最后，而 F8 的封顶是「保留头部、砍尾部」，
+        // 于是每天新写的行大概率一进入文件就被裁掉，日志变成永远的旧内容。
+        const firstDay = el.search(/^## /m);
+        let at;
+        if (firstDay >= 0) {
+          at = el.lastIndexOf("\n", firstDay) + 1;
+        } else {
+          // 标题块 = 从开头到第一个 "* " 条目行（或空行结束）之前
+          const firstItem = el.search(/^\* /m);
+          at = firstItem >= 0 ? el.lastIndexOf("\n", firstItem) + 1 : el.length;
+        }
+        lc = el.slice(0, at) + "\n## " + today + "\n" + logEntries.join("\n") + "\n" + el.slice(at);
+      }
+    } else {
+      lc = "# 编译日志（Evolution Log）\n\n> 记录 wiki/patterns/ 的编译、合并、归档事件。\n> 格式：* **<类型>**: <详情>\n\n"
+        + "## " + today + "\n" + logEntries.join("\n") + "\n";
+    }
+    // F8：封顶。两个整段都来自 newest-first 的插入点，所以保留头部（最新）即可。
+    writeFileSync(logsFile, capLogLines(lc).text);
   }
   return { created: created.length, orphans: orphanPages.length, patterns: created };
 }
@@ -387,6 +418,33 @@ function compilePatterns(pages) {
 // ── --dsh-export: 把 DSH 会话（~/.dsh/sessions/*/session-*/session.jsonl.zstd）导出为复盘 markdown 到 raw/sessions/dsh/
 // 幂等：state.exportedDsh 记录 {sessionId: mtime}；只导出 user 文本 + assistant 正文（不导出 reasoning/工具详情）
 const DSH_SESSIONS = join(homedir(), ".dsh/sessions");
+
+// ── F5：会话导出的三道闸 ──────────────────────────────────────────────────────
+// ① 默认关闭。把整段对话落盘是「需要时才做」的事，不该挂在生命周期钩子上。
+// ② 默认写到 ~/.dsh/llm-wiki/ 下，**不落 vault**。vault 在 /mnt/d —— Windows 可写、
+//    可能被 Obsidian 同步或共享，把对话全文放进去等于扩大了泄露面。
+// ③ 只导最近一段，不再「全历史静默导出」。
+//    三道闸都在 DSH_EXPORT_ENABLED 之后才谈得上；第一个没过就什么都不做。
+// ① 默认关闭。不显式给 LLM_WIKI_EXPORT_SESSIONS=1 就什么都不做 —— 这是三道闸里
+//    唯一能挡住「静默」的，后面两道都只是缩小爆炸半径。
+const DSH_EXPORT_ENABLED = process.env.LLM_WIKI_EXPORT_SESSIONS === "1";
+// ② 默认写到 ~/.dsh/llm-wiki/ 下，**不落 vault**。vault 在 /mnt/d —— Windows 可写、
+//    可能被 Obsidian 同步或共享，把对话全文放进去等于扩大了泄露面。
+const DSH_EXPORT_DIR = process.env.LLM_WIKI_EXPORT_DIR || join(STATE_DIR, "sessions-export");
+// ③ 只导最近一段，不再「全历史静默导出」。这是「逐会话同意」在 CLI 语言里的替代品。
+const DSH_EXPORT_DEFAULT_DAYS = 7;
+const DSH_EXPORT_DEFAULT_LIMIT = 20;
+// 窗口的两个旋钮：天数（环境变量，日常调）与绝对日期（--since，精确覆盖）。
+// `--since 1970-01-01` = 全历史 —— 这是「确实要全导」的唯一显式写法，
+// 不会是默认值，也不可能因为误操作触发。
+const DSH_EXPORT_DAYS = Number(process.env.LLM_WIKI_EXPORT_DAYS) || DSH_EXPORT_DEFAULT_DAYS;
+function argValue(nm) {
+  const i = rawArgs.indexOf(nm);
+  return i >= 0 && i + 1 < rawArgs.length ? rawArgs[i + 1] : null;
+}
+const DSH_EXPORT_SINCE = argValue("--since");
+// 上限默认 20。Math.max(1, …)：显式给 --limit 0 会让整个 flag 变哑弹，宁可忽略也不沉默。
+const DSH_EXPORT_LIMIT = Math.max(1, Number(argValue("--limit")) || DSH_EXPORT_DEFAULT_LIMIT);
 
 function buildSessionMd(sessionId, raw) {
   const meta = { cwd: "", preset: "", createdAt: 0 };
@@ -421,10 +479,27 @@ function buildSessionMd(sessionId, raw) {
     }
   }
   flush();
+  // F5：脱敏。技能文件写着「密钥不入库」，但规则管得住「主动写入」，管不住
+  // 「顺手粘进对话」—— 而会话复盘会落进 vault，vault 在 /mnt/d，可能被同步或共享。
+  // 这是兜底，不是许可：脱敏永远漏得掉，所以主手段是「默认关闭 + 输出迁出 vault」。
+  let redactedBlocks = 0;
+  const safe = blocks.map(b => {
+    const t = redactSecrets(b.text);
+    if (t !== b.text) redactedBlocks++;
+    return { role: b.role, text: t };
+  });
   const date = meta.createdAt ? new Date(meta.createdAt).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
   const title = "DSH 会话复盘" + (meta.cwd ? "：" + String(meta.cwd).split("/").filter(Boolean).pop() : "");
-  let md = "---\ntitle: \"" + title + "\"\ntags: [dsh, session]\ntype: \"发现\"\ncreated: " + date + "\nsource: \"dsh:" + sessionId + "\"\n---\n\n# " + title + "\n\n- **会话**: " + sessionId + "\n- **工作目录**: " + (meta.cwd || "-") + "\n- **Agent 预设**: " + (meta.preset || "-") + "\n- **创建时间**: " + (meta.createdAt ? new Date(meta.createdAt).toISOString() : "-") + "\n- **消息块**: " + blocks.length + "\n\n## 对话记录\n\n";
-  for (const b of blocks) {
+  let md = "---\ntitle: \"" + title + "\"\ntags: [dsh, session]\ntype: \"发现\"\ncreated: " + date
+    + "\nsource: \"dsh:" + sessionId + "\"\nredacted: " + (redactedBlocks > 0) + "\n---\n\n# " + title + "\n\n"
+    + "- **会话**: " + sessionId
+    + "\n- **工作目录**: " + (meta.cwd || "-")
+    + "\n- **Agent 预设**: " + (meta.preset || "-")
+    + "\n- **创建时间**: " + (meta.createdAt ? new Date(meta.createdAt).toISOString() : "-")
+    + "\n- **消息块**: " + safe.length
+    + (redactedBlocks ? "\n- **已脱敏块**: " + redactedBlocks : "")
+    + "\n\n## 对话记录\n\n";
+  for (const b of safe) {
     md += "### " + (b.role === "user" ? "用户" : "助手") + "\n\n" + b.text + "\n\n";
   }
   return md;
@@ -433,10 +508,24 @@ function buildSessionMd(sessionId, raw) {
 function dshSessionExport() {
   const state = loadState();
   const exported = state.exportedDsh || {};
-  const outDir = join(VAULT, "raw/sessions/dsh");
+  const outDir = DSH_EXPORT_DIR;
   mkdirSync(outDir, { recursive: true });
-  let exportedNow = 0;
-  const results = [];
+
+  // 用户确实把导出目录指回 vault 时，留一个哨兵并明说 —— 默认路径已经不在 vault 里了。
+  let warnedInVault = false;
+  try {
+    if (isInside(outDir, VAULT)) {
+      writeFileSync(join(outDir, ".no-sync"), "此目录含 DSH 会话全文，请把它排除出 Obsidian / 网盘同步。\n");
+      warnedInVault = true;
+    }
+  } catch {}
+
+  // ③ 先按 mtime 收集候选，再筛「最近 N 天」并取前 limit 个 —— 不再全历史导出。
+  //    窗口边界 = LLM_WIKI_EXPORT_DAYS 天前；--since 给的绝对日期优先。
+  const sinceMs = DSH_EXPORT_SINCE ? Date.parse(DSH_EXPORT_SINCE) : (Date.now() - DSH_EXPORT_DAYS * 86400_000);
+  if (DSH_EXPORT_SINCE && Number.isNaN(sinceMs)) return { error: "--since 不是合法日期: " + DSH_EXPORT_SINCE };
+
+  const candidates = [];
   try {
     for (const ws of readdirSync(DSH_SESSIONS)) {
       const wsDir = join(DSH_SESSIONS, ws);
@@ -448,22 +537,47 @@ function dshSessionExport() {
         const zf = join(sdir, "session.jsonl.zstd");
         try {
           if (!statSync(sdir).isDirectory() || !existsSync(zf)) continue;
-          const st = statSync(zf);
-          if (exported[sd] === st.mtimeMs) continue;
-          const raw = execFileSync("zstd", ["-d", "-c", zf], { maxBuffer: 256 * 1024 * 1024, encoding: "utf8" });
-          const md = buildSessionMd(sd, raw);
-          const date = new Date(st.mtimeMs).toISOString().slice(0, 10);
-          const dest = join(outDir, date + "-" + sd.replace(/^session-/, "").slice(0, 8) + ".md");
-          writeFileSync(dest, md);
-          exported[sd] = st.mtimeMs;
-          exportedNow++;
-          results.push(sd.slice(0, 16));
-        } catch (e) { results.push(sd.slice(0, 16) + " ERR"); }
+          candidates.push({ sd, zf, mtimeMs: statSync(zf).mtimeMs });
+        } catch {}
       }
     }
-    if (exportedNow > 0) saveState({ ...state, exportedDsh: exported });
-    return { exported: exportedNow, tracked: Object.keys(exported).length, results: results.slice(0, 6) };
   } catch (e) { return { error: String(e.message || e).slice(0, 120) }; }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const inWindow = candidates.filter(c => c.mtimeMs >= sinceMs);
+  const selected = inWindow.slice(0, DSH_EXPORT_LIMIT);
+
+  let exportedNow = 0, skipped = 0;
+  const results = [];
+  for (const c of selected) {
+    try {
+      if (exported[c.sd] === c.mtimeMs) { skipped++; continue; }
+      // 用 node:zlib 内置的 zstd 解压，不再 fork `zstd` 二进制。
+      // 理由：这是本机缺的外部依赖（本机 only gzip/xz/bzip2），缺了整阶段就静默失败，
+      // 而 Node ≥22.15 自带 zstdDecompressSync —— 少一个「装了但跑不了」。
+      const raw = zstdDecompressSync(readFileSync(c.zf)).toString("utf8");
+      const md = buildSessionMd(c.sd, raw);
+      const date = new Date(c.mtimeMs).toISOString().slice(0, 10);
+      const dest = join(outDir, date + "-" + c.sd.replace(/^session-/, "").slice(0, 8) + ".md");
+      writeFileSync(dest, md);
+      exported[c.sd] = c.mtimeMs;
+      exportedNow++;
+      results.push(c.sd.slice(0, 16));
+    } catch { results.push(c.sd.slice(0, 16) + " ERR"); }
+  }
+  if (exportedNow > 0) saveState({ ...state, exportedDsh: exported });
+  return {
+    exported: exportedNow,
+    skipped,
+    candidates: candidates.length,
+    inWindow: inWindow.length,
+    truncated: inWindow.length - selected.length,
+    since: new Date(sinceMs).toISOString().slice(0, 10),
+    outDir,
+    ...(warnedInVault ? { warn: "导出目录在 vault 内，已写 .no-sync 哨兵" } : {}),
+    tracked: Object.keys(exported).length,
+    results: results.slice(0, 6),
+  };
 }
 
 // ── --docs-sync: 把 mnemon Documents（~/.mnemon/documents/active/*.md）回流为 wiki 页
@@ -652,6 +766,12 @@ function lint(pages) {
         issues.push({ type: "stale_after", path: p.rel, message: "已过期: " + fmd.stale_after });
       }
     }
+    // F4：标题是注入面的源头（标题会进 index.md，而 index.md 曾每轮进系统提示词）。
+    // 只告警不删除 —— 误报的代价是作者看到一条警告，漏报的代价是标题进系统提示词，两者不对称。
+    const titleForCheck = String(p.fm.title == null ? "" : p.fm.title);
+    if (isSuspiciousTitle(titleForCheck)) {
+      issues.push({ type: "suspicious_title", path: p.rel, message: "标题疑似指令注入: " + safeTitle(titleForCheck, 60) });
+    }
     const wl = (p.content.match(/\[\[[^\]]+\]\]/g) || []).length;
     if (wl < 2) issues.push({ type: "few_wikilinks", path: p.rel, message: "wikilink " + wl });
     for (const m of p.content.matchAll(/\[\[([^\]#|]+)/g)) {
@@ -687,8 +807,19 @@ function rebuildIndex(pages) {
   for (const c of cats) md += "* [wiki/" + c + "](wiki/" + c + "/index.md) — " + byCat[c] + " 条\n";
   const recent = [...pages].sort((a, b) => b.mtime - a.mtime).slice(0, 10);
   md += "\n## 最近更新\n\n";
-  for (const p of recent) md += "* [" + (p.fm.title || p.file) + "](" + p.rel + ") — " + new Date(p.mtime).toISOString().slice(0, 10) + "\n";
-  return md;
+  // F4：标题消毒。初稿只去 `[[` / `]]`，但**单个 `]` 就足以破坏** `* [title](rel)` 这个链接。
+  for (const p of recent) md += "* [" + safeTitle(p.fm.title || p.file) + "](" + p.rel + ") — " + new Date(p.mtime).toISOString().slice(0, 10) + "\n";
+
+  // F4：注入面收敛的载体。插件读这份 JSON 而不是读 index.md 原文 ——
+  // 这里**刻意只有数字，没有任何标题**，所以模型可写的文本完全不进系统提示词。
+  const latestMs = pages.reduce((m, p) => Math.max(m, Number(p.mtime) || 0), 0);
+  const stats = {
+    generated: new Date().toISOString(),
+    total: pages.length,
+    byType: byCat,
+    latest: latestMs ? new Date(latestMs).toISOString().slice(0, 10) : null,
+  };
+  return { md, stats };
 }
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
@@ -774,7 +905,7 @@ function appendLog(entry) {
   const logPath = join(VAULT, "log.md");
   try {
     const line = "## [" + new Date().toISOString().slice(0, 10) + "] pipeline | " + entry + "\n";
-    if (existsSync(logPath)) writeFileSync(logPath, line + readFileSync(logPath, "utf8"));
+    if (existsSync(logPath)) writeFileSync(logPath, capLogLines(line + readFileSync(logPath, "utf8")).text);
     else writeFileSync(logPath, "# LLM-Wiki 操作日志\n\n" + line);
   } catch {}
 }
@@ -821,9 +952,14 @@ async function main() {
       console.log("\n== index ==\n[跳过] wiki 页面数为 0，拒绝用空内容覆盖 index.md");
       summary.push("index:跳过(空)");
     } else {
-      const md = rebuildIndex(pages);
-      if (!DRY) { writeFileSync(join(WIKI, "index.md"), md); console.log("\n== index ==\n已重建 wiki/index.md"); summary.push("index:重建"); }
-      else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md");
+      const { md, stats } = rebuildIndex(pages);
+      if (!DRY) {
+        writeFileSync(join(WIKI, "index.md"), md);
+        // F4：这份统计是注入面的全部内容（约 200 字节，无标题）。插件读它，不读 index.md。
+        writeFileSync(join(WIKI, "index-stats.json"), JSON.stringify(stats, null, 2));
+        console.log("\n== index ==\n已重建 wiki/index.md + index-stats.json");
+        summary.push("index:重建");
+      } else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md + index-stats.json");
     }
   }
   if (RUN.usage) {
@@ -853,8 +989,19 @@ async function main() {
   }
   if (RUN.dsh) {
     console.log("\n== dsh-export ==");
-    if (DRY) console.log("(--dry-run) 将导出 DSH 会话复盘到 raw/sessions/dsh/");
-    else { const r = dshSessionExport(); console.log("导出:", JSON.stringify(r)); summary.push("dsh:" + (r.exported || 0) + "个"); }
+    if (!DSH_EXPORT_ENABLED) {
+      // ① 默认关闭。这是「把整段对话落盘」的操作，不该因为一个 flag 就打开展开。
+      console.log("[已禁用] 会话导出默认关闭 —— 它会把对话全文（可能含密钥、私有路径）写到磁盘。");
+      console.log("  确需导出：LLM_WIKI_EXPORT_SESSIONS=1");
+      console.log("  建议同时把 LLM_WIKI_EXPORT_DIR 指向 vault 之外（默认 " + DSH_EXPORT_DIR + "）。");
+      summary.push("dsh:禁用");
+    } else if (DRY) {
+      console.log("(--dry-run) 将导出 DSH 会话复盘到 " + DSH_EXPORT_DIR + "（最近 " + DSH_EXPORT_DAYS + " 天，最多 " + DSH_EXPORT_LIMIT + " 个）");
+    } else {
+      const r = dshSessionExport();
+      console.log("导出:", JSON.stringify(r));
+      summary.push("dsh:" + (r.exported || 0) + "个" + (r.truncated ? "(截断" + r.truncated + ")" : ""));
+    }
   }
   if (RUN.prune) {
     console.log("\n== prune-memory ==");

@@ -9,7 +9,7 @@ RestartSec=5
 UMask=077
 
 # ── F7-6: systemd 沙箱 ──
-# 这个进程只做一件事：读 ~/.modlens/config.json 取 key，然后监听一个本地端口转发到
+# 这个进程只做一件事：读 ~/.config/llm-wiki/embed.json 取 key，然后监听一个本地端口转发到
 # api.siliconflow.cn。它不需要写任何文件、不需要设备、不需要内核接口。
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -35,7 +35,7 @@
 - ripgrep（wiki-search 检索）
 - mnemon CLI + dsh-mnemon 插件（记忆体）
 - Obsidian vault（wiki 页面），目录结构见 [wiki 结构](#wiki-结构)
-- SiliconFlow API key（可选，用于向量召回；复用 ~/.modlens/config.json 或环境变量 EMBED_KEY）
+- SiliconFlow API key（可选，用于向量召回；`~/.config/llm-wiki/embed.json` 或环境变量 EMBED_KEY）
 
 ## 安装
 
@@ -114,9 +114,21 @@ node ~/bin/llm-wiki-pipeline.mjs --all --dry-run # 预览模式（零写入）
 
 # 破坏性 / 显式阶段 —— 不再隐含在 --all 里，必须点名
 node ~/bin/llm-wiki-pipeline.mjs --prune-memory     # 软删来源已消失的记忆体条目（三重保险，见下）
-node ~/bin/llm-wiki-pipeline.mjs --dsh-export       # 导出 DSH 会话到 raw/sessions/dsh/
+node ~/bin/llm-wiki-pipeline.mjs --dsh-export       # 导出 DSH 会话复盘（默认关闭、不落 vault，见下）
 node ~/bin/llm-wiki-pipeline.mjs --compile-patterns # 从孤立节点聚类生成 pattern 页
 ```
+
+`--dsh-export` 是唯一会把**整段对话**写到磁盘的阶段。它默认关闭，且默认不落 vault：
+
+| 闸 | 默认 | 打开方式 |
+|---|---|---|
+| 开关 | 关 | `LLM_WIKI_EXPORT_SESSIONS=1` |
+| 输出位置 | `~/.dsh/llm-wiki/sessions-export/`（不在 vault / Obsidian 里） | `LLM_WIKI_EXPORT_DIR=<目录>`（指回 vault 会自动写 `.no-sync` 哨兵） |
+| 时间窗 | 最近 7 天、最多 20 个 | `LLM_WIKI_EXPORT_DAYS=90` 或 `--since 1970-01-01`（= 全历史） |
+| 数量上限 | 20 | `--limit 50` |
+
+会话正文写盘前会过一遍密钥脱敏（PEM / `sk-` `ghp_` `AKIA` / JWT / `password:` / Bearer），命中的块会在
+frontmatter 记 `redacted: true`。这是**兜底**，一定漏得掉 —— 真正的防线是上面三道闸。
 
 `--prune-memory` 是全项目唯一会**批量删除持久化数据**的操作，它判定「孤儿」的唯一依据是
 「vault 里找不到这个文件」—— 挂载缺失时这个判断会把整个记忆体判成孤儿。三道保险任一触发即拒绝：
@@ -177,9 +189,14 @@ node ~/bin/wiki-convert.mjs 文件.html \
 | LLM_WIKI_VAULT | /mnt/d/DB/Obsidian/LLM-Wiki | vault 路径（不存在时管线中止并返回退出码 3） |
 | LLM_WIKI_STATE | ~/.dsh/llm-wiki/pipeline-state.json | 管线增量状态文件（schema 2：存语义指纹；旧版 mtime 状态会被识别为过期并触发一次全量重算） |
 | LLM_WIKI_PIPELINE | ~/bin/llm-wiki-pipeline.mjs | 插件触发的管线脚本路径 |
-| EMBED_KEY | 读 ~/.modlens/config.json | SiliconFlow API key |
+| EMBED_KEY | 读 `~/.config/llm-wiki/embed.json` 的 `siliconflow.apiKey` | SiliconFlow API key。**专用凭据**——不复用 `~/.modlens/config.json`，那里躺着的是别的厂商的 key，发来 SiliconFlow 等于外泄 |
 | EMBED_MODEL | BAAI/bge-m3 | 向量模型 |
-| EMBED_PORT | 11434 | embed-proxy 监听端口（挪到 11500 需 mnemon 支持 OLLAMA_HOST，未验证） |
+| EMBED_PORT | 11434 | embed-proxy 监听端口。挪去 11500 可避免遮蔽本机之后可能安装的真 Ollama，但需 mnemon 支持 `OLLAMA_HOST` 指向新端口——**这一点未经验证**，确认前保持 11434 |
+| EMBED_ALLOW_OPENAI_KEY | （未设） | key 形如 `sk-proj-`/超长随机串（疑似 OpenAI 格式）时默认拒绝启动；设 `1` 放行 |
+| LLM_WIKI_EXPORT_SESSIONS | （未设） | `1` 才启用 `--dsh-export`。默认关闭 |
+| LLM_WIKI_EXPORT_DIR | `~/.dsh/llm-wiki/sessions-export/` | 会话复盘输出目录。默认**不在 vault 里**；指回 vault 会自动写 `.no-sync` 哨兵 |
+| LLM_WIKI_EXPORT_DAYS | 7 | 只导出最近 N 天的会话（`--since <日期>` 可精确覆盖） |
+| LLM_WIKI_EXPORT_LIMIT | 20 | 单次最多导出几个会话（`--limit <N>` 可覆盖） |
 | LLM_WIKI_CONVERTERS | （未设） | 转换器搜索目录，优先于 `converters/bin/` 与 `~/bin` |
 
 ## wiki 结构
@@ -187,14 +204,14 @@ node ~/bin/wiki-convert.mjs 文件.html \
 ```
 LLM-Wiki/
 ├── schema.md                # 运行时守则（插件注入到系统提示）
-├── log.md                   # 操作日志（管线追加）
+├── log.md                   # 操作日志（管线追加，500 行封顶）
 ├── raw/                     # [Raw Layer] 原始素材（追加写入，永不删除）
 │   ├── sessions/dsh/        # DSH 会话导出（管线 --dsh-export 自动生成）
 │   └── zinbox-index/        # ZInBox 剪藏原始源
 ├── wiki/                    # [Wiki Layer] 编译后的结构化知识
 │   ├── index.md             # 导航页（管线 --index 自动生成）
 │   ├── evolution/
-│   │   ├── logs.md          # 编译日志（pattern 创建/合并/归档事件）
+│   │   ├── logs.md          # 编译日志（pattern 创建/合并/归档事件，同受 500 行封顶）
 │   │   └── skill-impact.md  # 技能影响追踪表
 │   ├── patterns/            # WikiSkill 模式页（管线 --compile-patterns 自动生成）
 │   │   ├── TEMPLATE.md      # Pattern 页模板

@@ -63,6 +63,7 @@ cssclasses: [<分类>]
 ## 写入后
 
 - 管线脚本（~/bin/llm-wiki-pipeline，或会话结束自动触发）会执行安全阶段：lint → 索引重建 → OKF 字段补齐 → 召回热度回写 → 记忆体同步（新页面进 mnemon recall）。
-- 破坏性阶段**不会**被自动触发，需要显式点名：`--prune-memory`（软删来源已消失的记忆体条目）、`--dsh-export`（把会话复盘落盘到 raw/）、`--compile-patterns`（生成 pattern 页）。
+- 破坏性阶段**不会**被自动触发，需要显式点名：`--prune-memory`（软删来源已消失的记忆体条目）、`--dsh-export`（把会话复盘落盘，默认关闭 + 不落 vault）、`--compile-patterns`（生成 pattern 页）。
+- `--dsh-export` 是唯一会写整段对话的阶段：默认关闭（需 `LLM_WIKI_EXPORT_SESSIONS=1`），默认输出到 vault 之外。**不要在用户没有明确要求时打开它**，也不要把输出目录指回 vault。
 - 若管线未运行，可手动提醒用户运行，或告知"会话结束后自动处理"。
 - 质量反馈闭环：用户评价页面有用/过时 → `node ~/bin/llm-wiki-pipeline.mjs --rate <路径> --rating useful|outdated`（useful 升 quality_score，outdated 标 stale）；管线 --usage 自动把记忆体召回热度回写 queried_count。
