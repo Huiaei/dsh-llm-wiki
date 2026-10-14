@@ -62,6 +62,8 @@ function readDeleted(home) {
 }
 
 function run(vault, home, args = []) {
+  // 锁跟着 STATE_FILE 走，HOME 已隔离到 home/ → 状态也落在 home/ 内，
+  // 与其它测试文件的 ~/.dsh/llm-wiki/pipeline.lock 不冲突。
   const env = { ...process.env, HOME: home, LLM_WIKI_VAULT: vault, LLM_WIKI_FAKE_EMBED: "never" };
   try {
     const out = execFileSync(process.execPath, [PIPELINE, ...args], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] });

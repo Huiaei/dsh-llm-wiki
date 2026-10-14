@@ -47,8 +47,11 @@ function setup({ titles = [PAYLOAD], schema = "# schema\n", pages = 3 } = {}) {
 }
 const cleanup = (root) => { try { rmSync(root, { recursive: true, force: true }); } catch {} };
 
-function runIndex(vault) {
-  const env = { ...process.env, LLM_WIKI_VAULT: vault, LLM_WIKI_FAKE_EMBED: "never" };
+function runIndex(vault, root) {
+  // 与 wiki-find 测试同一理由：LLM_WIKI_STATE 不隔离时，npm test 并行跑会抢
+  // ~/.dsh/llm-wiki/pipeline.lock，被拒的一方安静退出 → 索引页没生成。
+  const env = { ...process.env, LLM_WIKI_VAULT: vault, LLM_WIKI_FAKE_EMBED: "never",
+                LLM_WIKI_STATE: root ? join(root, "state.json") : undefined };
   return execFileSync(process.execPath, [PIPELINE, "--index"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] });
 }
 
@@ -71,7 +74,7 @@ describe("F4 注入面收敛：预览不含任何标题", () => {
   test("① 预览 section 的返回值不含夹具里的任一标题（核心验收点）", async () => {
     const c = setup({ titles: [PAYLOAD, MULTILINE] });
     try {
-      runIndex(c.vault);
+      runIndex(c.vault, c.root);
       const { byName } = await loadSections(c.vault);
       const text = byName["llm-wiki:preview"].text();
       assert.ok(text.length > 0, "预览不应为空（index-stats.json 已生成）");
@@ -86,7 +89,7 @@ describe("F4 注入面收敛：预览不含任何标题", () => {
   test("② 预览含 UNTRUSTED_NOTICE 且被 <wiki-index> 围栏包裹", async () => {
     const c = setup();
     try {
-      runIndex(c.vault);
+      runIndex(c.vault, c.root);
       const { byName } = await loadSections(c.vault);
       const text = byName["llm-wiki:preview"].text();
       assert.match(text, /不可信数据/);
@@ -101,7 +104,7 @@ describe("F4 注入面收敛：预览不含任何标题", () => {
   test("⑥ 预览不是 index.md 的渲染：< 2KB 且不含 markdown 链接行（回归锁）", async () => {
     const c = setup({ titles: [PAYLOAD], pages: 40 });
     try {
-      runIndex(c.vault);
+      runIndex(c.vault, c.root);
       const { byName } = await loadSections(c.vault);
       const text = byName["llm-wiki:preview"].text();
       assert.ok(text.length < 2048, `预览应小于 2KB，实际 ${text.length}`);
@@ -129,7 +132,7 @@ describe("F4 注入面收敛：预览不含任何标题", () => {
   test("管线产出的 index-stats.json 只有数字，index.md 仍保留（消毒后的）标题", () => {
     const c = setup();
     try {
-      runIndex(c.vault);
+      runIndex(c.vault, c.root);
       const statsRaw = readFileSync(join(c.vault, "wiki", "index-stats.json"), "utf8");
       const stats = JSON.parse(statsRaw);
       assert.equal(stats.total, 3);

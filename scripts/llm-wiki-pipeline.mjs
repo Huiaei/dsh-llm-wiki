@@ -14,6 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import { zstdDecompressSync } from "node:zlib";
 import { CATS, extractFmText, parseFm, parseFmYaml, setFmField, deleteFmField, repairStructuredFields } from "./lib/frontmatter.mjs";
 import { STATE_SCHEMA, pageHashes, changedPages, stateEntry, trustTier, isRetired, TRUST_IMPORTANCE } from "./lib/hash.mjs";
+import { normalize } from "./lib/search.mjs";
 import { safeJoinVault, isInside } from "./lib/paths.mjs";
 import { safeTitle, isSuspiciousTitle } from "./lib/sanitize.mjs";
 import { redactSecrets, capLogLines } from "./lib/redact.mjs";
@@ -809,25 +810,61 @@ function lint(pages) {
 
 function rebuildIndex(pages) {
   const byCat = {};
-  for (const p of pages) byCat[p.cat] = (byCat[p.cat] || 0) + 1;
+  for (const p of pages) (byCat[p.cat] ||= []).push(p);
   const cats = CATS.filter(c => byCat[c]);
   let md = "# LLM-Wiki 知识库导航\n\nAgent 自主浏览入口。通过以下分类逐级浏览。\n\n> 此页面由管线自动维护。\n\n## 分类\n\n";
-  for (const c of cats) md += "* [wiki/" + c + "](wiki/" + c + "/index.md) — " + byCat[c] + " 条\n";
+  for (const c of cats) md += "* [wiki/" + c + "](wiki/索引/" + c + ".md) — " + byCat[c].length + " 条\n";
   const recent = [...pages].sort((a, b) => b.mtime - a.mtime).slice(0, 10);
   md += "\n## 最近更新\n\n";
   // F4：标题消毒。初稿只去 `[[` / `]]`，但**单个 `]` 就足以破坏** `* [title](rel)` 这个链接。
   for (const p of recent) md += "* [" + safeTitle(p.fm.title || p.file) + "](" + p.rel + ") — " + new Date(p.mtime).toISOString().slice(0, 10) + "\n";
 
+  // ── O5：分类索引页落盘，替代 Dataview ──
+  // 上游 SKILL.md 让模型先读 `wiki/索引/<分类>.md`（Dataview 聚合），但管线从不生成它
+  // （"索引"在 EXCLUDE_DIRS，也不在 CATS 里）→ 读路径隐式依赖 Obsidian + Dataview，
+  // 而 README 依赖表没列 Dataview。没有 Dataview 的人模型每次都会撞一个不存在的文件。
+  //
+  // 排序用 generateDraft 同源信号（质量分 / 信任分级 / 陈旧度），不引 lib/search.mjs：
+  // 那边是"查询相关度"，这边是"全量浏览序"，意图不同；但权重刻意保持同向，
+  // 否则同一个库在"浏览"和"检索"两条路径会给出两套"重要"。
+  const idxDir = join(WIKI, "索引");
+  const idxPages = [];
+  for (const c of cats) {
+    const list = byCat[c].slice().sort((a, b) => {
+      const qa = Number(a.fm.quality_score) || 0, qb = Number(b.fm.quality_score) || 0;
+      if (qb !== qa) return qb - qa;
+      const da = String(a.fm.updated || a.fm.created || ""), db = String(b.fm.updated || b.fm.created || "");
+      if (da !== db) return db.localeCompare(da);
+      return normalize(a.fm.title || a.file).localeCompare(normalize(b.fm.title || b.file), "zh-Hans-CN");
+    });
+    let im = "# " + c + "（" + list.length + " 条）\n\n> 由管线自动生成。检索时先在本页粗筛，再用 `wiki-find` 排序检索、`read` 读原文。\n\n";
+    for (const p of list) {
+      const tier = trustTier(p.fm);
+      const st = p.fm.status && p.fm.status !== "active" ? p.fm.status : "";
+      const flags = [tier, st, p.fm.superseded_by ? "superseded" : ""].filter(Boolean).join(" · ");
+      const q = Number(p.fm.quality_score) || 0;
+      const rawDesc = p.fm.description && p.fm.description !== "-" ? p.fm.description : "";
+      const descPart = rawDesc ? " — " + safeTitle(rawDesc, 80) : "";
+      im += "* [" + safeTitle(p.fm.title || p.file) + "](" + p.rel + ")" + descPart
+        + " `q" + q + (flags ? " · " + flags : "") + "`\n";
+    }
+    idxPages.push({ cat: c, md: im });
+  }
+
   // F4：注入面收敛的载体。插件读这份 JSON 而不是读 index.md 原文 ——
   // 这里**刻意只有数字，没有任何标题**，所以模型可写的文本完全不进系统提示词。
+  //
+  // ⚠️ byType 必须是 `{分类名: 页数}`。O5 把 byCat 从计数 map 改成 `{分类名: 页对象[]}`
+  // 之后，这里直接塞 byCat 会让整套页面（含 title/fm/正文）序列化进 stats ——
+  // F4 的注入面收敛当场失效，且文件从 200B 涨到几十 KB。实测踩过，勿改回。
   const latestMs = pages.reduce((m, p) => Math.max(m, Number(p.mtime) || 0), 0);
   const stats = {
     generated: new Date().toISOString(),
     total: pages.length,
-    byType: byCat,
+    byType: Object.fromEntries(Object.entries(byCat).map(([c, ps]) => [c, ps.length])),
     latest: latestMs ? new Date(latestMs).toISOString().slice(0, 10) : null,
   };
-  return { md, stats };
+  return { md, stats, idxDir, idxPages };
 }
 
 function loadState() { try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
@@ -987,14 +1024,21 @@ async function main() {
       console.log("\n== index ==\n[跳过] wiki 页面数为 0，拒绝用空内容覆盖 index.md");
       summary.push("index:跳过(空)");
     } else {
-      const { md, stats } = rebuildIndex(pages);
+      const { md, stats, idxDir, idxPages } = rebuildIndex(pages);
       if (!DRY) {
         atomicWrite(join(WIKI, "index.md"), md);
         // F4：这份统计是注入面的全部内容（约 200 字节，无标题）。插件读它，不读 index.md。
         atomicWrite(join(WIKI, "index-stats.json"), JSON.stringify(stats, null, 2));
-        console.log("\n== index ==\n已重建 wiki/index.md + index-stats.json");
-        summary.push("index:重建");
-      } else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md + index-stats.json");
+        // O5：分类索引页。只写非空分类的页 —— 空分类不生成空壳文件。
+        //  一次性全量 mkdir：目录里可能有上一次留下的空分类文件，写它们之前先清场。
+        mkdirSync(idxDir, { recursive: true });
+        for (const f of readdirSync(idxDir)) {
+          if (f.endsWith(".md") && !idxPages.some(x => x.cat + ".md" === f)) rmSync(join(idxDir, f));
+        }
+        for (const x of idxPages) atomicWrite(join(idxDir, x.cat + ".md"), x.md);
+        console.log("\n== index ==\n已重建 wiki/index.md + index-stats.json + 索引/" + idxPages.map(x => x.cat).join("/") + ".md");
+        summary.push("index:重建(分类索引 " + idxPages.length + " 页)");
+      } else console.log("\n== index ==\n(--dry-run) 将重建 wiki/index.md + index-stats.json + 分类索引页");
     }
   }
   if (RUN.usage) {

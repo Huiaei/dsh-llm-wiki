@@ -13,7 +13,7 @@
      ├─ systemd timer 每日 10:00 自动运行
      └─ 插件 session/disposed 事件触发（60s 防重入）
 记：mnemon 记忆体（向量语义召回）
-读：wiki-search SKILL（rg + read 检索原文）
+读：wiki-search SKILL（wiki-find 排序检索 + 分类索引页 + read 原文）
 馈：--rate 质量反馈 / --usage 召回热度回写 queried_count
 编：--compile-patterns 从孤立节点聚类生成 pattern 页（WikiSkill 核心创新）
 向：embed-proxy.mjs（Ollama 兼容代理 → SiliconFlow /v1/embeddings，可选）
@@ -25,6 +25,7 @@
 | 检索技能 | skills/wiki-search/SKILL.md | ~/.agents/skills/wiki-search/ |
 | 写入技能 | skills/wiki-write/SKILL.md | ~/.agents/skills/wiki-write/ |
 | 管线 | scripts/llm-wiki-pipeline.mjs | ~/bin/ |
+| 排序检索（O5） | scripts/wiki-find.mjs | ~/bin/ |
 | 向量代理 | scripts/embed-proxy.mjs | ~/bin/ + systemd 服务 |
 | 定时 | systemd/llm-wiki-pipeline.timer | ~/.config/systemd/user/ |
 
@@ -93,6 +94,10 @@ systemctl --user restart dsh-web
 
 - **写入知识**：直接说"把这个记到知识库"，模型按 wiki-write 技能写入对应分类
 - **检索知识**：问"之前怎么做的"，模型按 wiki-search 技能检索并引用原文
+- **手动检索**：`node ~/bin/wiki-find.mjs "<关键词>" --top 10`（加 `--json` 拿结构化结果、`--cat <分类>` 限定范围）
+  - 输出按标题/标签/摘要/正文加权 + `quality_score` + 信任分级 + 新鲜度排序，`<superseded>` / `<stale>` 已标注。
+  - 中文分词用 2-gram 近似（项目零依赖，不引分词库）：对"部署流程"这类词有效，但有噪声命中，也不能跨语言（`DEPLOY` 搜不到"部署"）。**分数用于排序，不用于判定相关性** —— 命中后仍需 `read` 原文确认。
+  - 分类索引页 `wiki/索引/<分类>.md` 是浏览入口（`--index` 生成，按质量分排序）。
 - **手动管线**：`node ~/bin/llm-wiki-pipeline.mjs --all`（安全阶段；破坏性阶段需点名，见下）
 - **摄取外部文档**：`node ~/bin/wiki-convert.mjs 文件.html --inbox "$VAULT/raw/inbox" --sources "$VAULT/raw/sources"`，再由模型按 wiki-write 落位（见下）
 - **质量反馈**：`node ~/bin/llm-wiki-pipeline.mjs --rate wiki/决策/xxx.md --rating useful|outdated`
@@ -210,6 +215,9 @@ LLM-Wiki/
 │   └── zinbox-index/        # ZInBox 剪藏原始源
 ├── wiki/                    # [Wiki Layer] 编译后的结构化知识
 │   ├── index.md             # 导航页（管线 --index 自动生成）
+│   ├── index-stats.json     # 分类计数统计（管线 --index；插件注入面只读它，无标题）
+│   ├── 索引/                # 分类索引页（管线 --index 自动生成，替代 Dataview）
+│   │   └── <分类>.md        # 该分类全部页面，按质量分排序，带 q<分>/信任分级标记
 │   ├── evolution/
 │   │   ├── logs.md          # 编译日志（pattern 创建/合并/归档事件，同受 500 行封顶）
 │   │   └── skill-impact.md  # 技能影响追踪表

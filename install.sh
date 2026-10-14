@@ -115,6 +115,8 @@ run mkdir -p "$HOME/bin/lib"
 run cp "$REPO/scripts/llm-wiki-pipeline.mjs" "$HOME/bin/"
 run cp "$REPO/scripts/embed-proxy.mjs" "$HOME/bin/"
 run cp "$REPO/scripts/wiki-convert.mjs" "$HOME/bin/"
+# O5: 排序检索 CLI。它 import lib/search.mjs，与下面 lib/ 的拷贝缺一不可。
+run cp "$REPO/scripts/wiki-find.mjs" "$HOME/bin/"
 # F7-4: 必须一起装 scripts/lib/。管线现在 import frontmatter/hash/paths/sanitize/redact/ingest，
 # 只 cp 单文件会让它在运行时 ERR_MODULE_NOT_FOUND —— 而插件是 detached + stdio:"ignore"
 # 启动它的，这个错误没有任何人看得见。
@@ -122,7 +124,7 @@ for f in "$REPO"/scripts/lib/*.mjs; do
   [ -e "$f" ] || continue
   run cp "$f" "$HOME/bin/lib/"
 done
-run chmod +x "$HOME/bin/llm-wiki-pipeline.mjs" "$HOME/bin/embed-proxy.mjs" "$HOME/bin/wiki-convert.mjs"
+run chmod +x "$HOME/bin/llm-wiki-pipeline.mjs" "$HOME/bin/embed-proxy.mjs" "$HOME/bin/wiki-convert.mjs" "$HOME/bin/wiki-find.mjs"
 
 # O10-③: 转换器是独立进程，产物不进版本库，所以这里要么复制已构建的二进制，要么现场构建。
 # 构建失败不致命 —— 管线不依赖转换器，只是文档摄取不可用。
@@ -159,4 +161,5 @@ echo "  首次记忆体同步: node ~/bin/llm-wiki-pipeline.mjs --sync"
 echo "  重启 dsh-web 使插件生效: systemctl --user restart dsh-web"
 echo "  向量（可选）: mnemon embed --all"
 echo "  文档摄取（可选）: node ~/bin/wiki-convert.mjs <文件> --inbox $VAULT/raw/inbox --sources $VAULT/raw/sources --json"
+echo "  检索（O5）: node ~/bin/wiki-find.mjs \"<关键词>\" --top 10"
 echo "安装完成。"
